@@ -13,8 +13,8 @@ const FEEDS = {
     { name: 'Ars Technica', url: 'https://feeds.arstechnica.com/arstechnica/index' },
   ],
   Business: [
-    { name: 'BBC Business', url: 'https://feeds.bbci.co.uk/news/business/rss.xml' },
-    { name: 'CNBC', url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html' },
+    { name: 'BBC Business', url: 'https://feeds.bbci.co.uk/news/business/rss.xml', articleImageLimit: 5, imageFetchConcurrency: 4 },
+    { name: 'CNBC', url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html', articleImageLimit: 3, imageFetchConcurrency: 3 },
   ],
   Sports: [
     { name: 'ESPN', url: 'https://www.espn.com/espn/rss/news' },
@@ -25,8 +25,8 @@ const FEEDS = {
     { name: 'Reuters', url: 'https://feeds.reuters.com/reuters/worldNews' },
   ],
   Science: [
-    { name: 'BBC Science', url: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml' },
-    { name: 'Nature', url: 'https://www.nature.com/nature.rss' },
+    { name: 'BBC Science', url: 'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml', articleImageLimit: 4, imageFetchConcurrency: 3, feedItemLimit: 8 },
+    { name: 'Nature', url: 'https://www.nature.com/nature.rss', articleImageLimit: 0, imageFetchConcurrency: 2, feedItemLimit: 5, rankBias: -22 },
   ],
 }
 

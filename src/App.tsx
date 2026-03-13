@@ -1,28 +1,75 @@
 import PodcastPlayer from './PodcastPlayer'
-import React, { useState, useEffect } from 'react'
-import { BookOpen, Headphones, Play, Brain, Sparkles, Loader2 } from 'lucide-react'
+import WatchPlayer from './WatchPlayer'
+import React, { startTransition, useEffect, useRef, useState } from 'react'
+import { ArrowLeft, ArrowRight, ArrowUpRight, Headphones, Play, Brain, Sparkles, Loader2, X } from 'lucide-react'
 
 interface NewsItem {
   id: string; category: string; title: string; summary: string
-  keyPoints: string[]; image: string | null; source: string; time: string; link: string
+  keyPoints: string[]; image: string | null; imageQuality?: 'high' | 'medium' | 'low' | 'fallback'; source: string; time: string; link: string
 }
+
+interface AnalysisState {
+  idx: number
+  loading: boolean
+  tldr?: string
+  keyPoints?: string[]
+  context?: string
+  sentiment?: string
+  readTime?: string
+}
+
+interface ReaderState {
+  item: NewsItem
+  idx: number
+}
+
+interface ArticleContent {
+  byline?: string
+  subtitle?: string
+  paragraphs: string[]
+}
+
+interface ArticleVideo {
+  url: string
+  kind: 'iframe' | 'video'
+  provider?: string
+  poster?: string
+  title?: string
+  source?: 'article' | 'youtube-search'
+}
+
+interface ArticleMedia {
+  url: string
+  caption?: string
+}
+
+const WATCH_IMAGE_TARGET = 4
 
 const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'World', 'Science']
 const API = '/api'
+function getRequiredWatchMediaCount(item: NewsItem) {
+  return Math.max(0, WATCH_IMAGE_TARGET - (item.image ? 1 : 0))
+}
+
 function getImage(item: any): string {
   if (item.image) return item.image
   const s = Math.abs([...item.title].reduce((a: number, c: string) => a + c.charCodeAt(0), 0))
   return `https://picsum.photos/seed/${s}/800/600`
 }
+
+function getImageQuality(item: NewsItem): 'high' | 'medium' | 'low' | 'fallback' {
+  if (!item.image) return 'fallback'
+  return item.imageQuality || 'medium'
+}
+
 const TODAY = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
 
-function Modes({ onClick, onListen, onDeep, onRead }: { onClick?: React.MouseEventHandler; onListen?: () => void; onDeep?: () => void; onRead?: () => void }) {
+function Modes({ onClick, onListen, onWatch, onDeep }: { onClick?: React.MouseEventHandler; onListen?: () => void; onWatch?: () => void; onDeep?: () => void }) {
   return (
     <div className="modes" onClick={onClick}>
-      <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onRead?.() }}><BookOpen size={10} /> Read</button>
-      <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onListen?.() }}><Headphones size={10} /> Listen</button>
-      <button className="mode-btn"><Play size={10} /> Watch</button>
-     <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onDeep?.() }}><Brain size={10} /> Deep</button>
+      <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onListen?.() }}><Headphones size={12} /> Listen</button>
+      <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onWatch?.() }}><Play size={12} /> Watch</button>
+     <button className="mode-btn" onClick={(e) => { e.stopPropagation(); onDeep?.() }}><Brain size={12} /> Digest</button>
     </div>
   )
 }
@@ -33,47 +80,610 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [showPodcast, setShowPodcast] = useState(false)
   const [podcastIdx, setPodcastIdx] = useState(0)
-  const [readArticle, setReadArticle] = useState<any>(null)
-  const [analysis, setAnalysis] = useState<any>(null)
+  const [podcastAutoPlayToken, setPodcastAutoPlayToken] = useState(0)
+  const [watch, setWatch] = useState<ReaderState | null>(null)
+  const [watchAnalysis, setWatchAnalysis] = useState<AnalysisState | null>(null)
+  const [watchContent, setWatchContent] = useState<ArticleContent | null>(null)
+  const [watchContentLoading, setWatchContentLoading] = useState(false)
+  const [watchMedia, setWatchMedia] = useState<string[]>([])
+  const [watchVideo, setWatchVideo] = useState<ArticleVideo | null>(null)
+  const [watchVideoLoading, setWatchVideoLoading] = useState(false)
+  const [analysis, setAnalysis] = useState<AnalysisState | null>(null)
+  const [reader, setReader] = useState<ReaderState | null>(null)
+  const [readerAnalysis, setReaderAnalysis] = useState<AnalysisState | null>(null)
+  const [readerContent, setReaderContent] = useState<ArticleContent | null>(null)
+  const [readerContentLoading, setReaderContentLoading] = useState(false)
+  const readerScrollRef = useRef(0)
+  const categoryCacheRef = useRef<Record<string, NewsItem[]>>({})
+  const pendingRequestsRef = useRef<Record<string, Promise<NewsItem[]>>>({})
+  const prefetchedRef = useRef(false)
+  const analysisCacheRef = useRef<Record<string, AnalysisState>>({})
+  const pendingAnalysisRef = useRef<Record<string, Promise<AnalysisState>>>({})
+  const contentCacheRef = useRef<Record<string, ArticleContent>>({})
+  const pendingContentRef = useRef<Record<string, Promise<ArticleContent>>>({})
+  const mediaCacheRef = useRef<Record<string, string[]>>({})
+  const pendingMediaRef = useRef<Record<string, Promise<string[]>>>({})
+  const videoCacheRef = useRef<Record<string, ArticleVideo | null>>({})
+  const pendingVideoRef = useRef<Record<string, Promise<ArticleVideo | null>>>({})
 
-  async function deepAnalyze(item: any, idx: number) {
+  async function fetchCategory(category: string, force = false): Promise<NewsItem[]> {
+    if (!force && categoryCacheRef.current[category]) return categoryCacheRef.current[category]
+    if (!force && pendingRequestsRef.current[category]) return pendingRequestsRef.current[category]
+
+    const request = fetch(`${API}/news?category=${encodeURIComponent(category)}`)
+      .then(r => r.json())
+      .then((items: NewsItem[]) => {
+        categoryCacheRef.current[category] = items
+        return items
+      })
+      .finally(() => {
+        delete pendingRequestsRef.current[category]
+      })
+
+    pendingRequestsRef.current[category] = request
+    return request
+  }
+
+  function openPodcast(startIdx: number) {
+    setPodcastIdx(startIdx)
+    setPodcastAutoPlayToken((value) => value + 1)
+    setShowPodcast(true)
+  }
+
+  function openWatch(item: NewsItem, idx: number) {
+    const key = getAnalysisKey(item)
+    setWatch({ item, idx })
+    setWatchAnalysis(analysisCacheRef.current[key] || { idx, loading: true })
+    setWatchContent(contentCacheRef.current[item.link] || null)
+    setWatchContentLoading(!contentCacheRef.current[item.link])
+    setWatchMedia(mediaCacheRef.current[item.link] || [])
+    setWatchVideo(videoCacheRef.current[item.link] ?? null)
+    setWatchVideoLoading(!(item.link in videoCacheRef.current))
+  }
+
+  function closeWatch() {
+    setWatch(null)
+    setWatchAnalysis(null)
+    setWatchContent(null)
+    setWatchContentLoading(false)
+    setWatchMedia([])
+    setWatchVideo(null)
+    setWatchVideoLoading(false)
+  }
+
+  function getAnalysisKey(item: NewsItem) {
+    return [item.title, item.summary || '', item.source || ''].join('||')
+  }
+
+  function openArticle(item: NewsItem, idx: number) {
+    readerScrollRef.current = window.scrollY
+    const nextReader = { item, idx }
+    const nextHash = `#story-${encodeURIComponent(item.id)}`
+    const nextAnalysis = analysisCacheRef.current[getAnalysisKey(item)] || { idx, loading: true }
+
+    setReader(nextReader)
+    setReaderAnalysis(nextAnalysis)
     setAnalysis(null)
+
+    if (window.location.hash.startsWith('#story-')) {
+      window.history.replaceState({ readerId: item.id }, '', nextHash)
+    } else {
+      window.history.pushState({ readerId: item.id }, '', nextHash)
+    }
+
+    window.scrollTo({ top: 0, behavior: 'auto' })
+  }
+
+  function closeArticle() {
+    if (window.location.hash.startsWith('#story-')) {
+      window.history.back()
+      return
+    }
+
+    setReader(null)
+    setReaderAnalysis(null)
+    window.scrollTo({ top: readerScrollRef.current, behavior: 'auto' })
+  }
+
+  async function fetchAnalysis(item: NewsItem, idx: number) {
+    const key = getAnalysisKey(item)
+
+    if (analysisCacheRef.current[key]) return analysisCacheRef.current[key]
+    if (pendingAnalysisRef.current[key]) return pendingAnalysisRef.current[key]
+
+    const request = fetch("/api/analyze?title=" + encodeURIComponent(item.title) + "&summary=" + encodeURIComponent(item.summary || "") + "&source=" + encodeURIComponent(item.source || ""))
+      .then(r => r.json())
+      .then((data) => {
+        const nextAnalysis = { idx, loading: false, ...data }
+        analysisCacheRef.current[key] = nextAnalysis
+        return nextAnalysis
+      })
+      .finally(() => {
+        delete pendingAnalysisRef.current[key]
+      })
+
+    pendingAnalysisRef.current[key] = request
+    return request
+  }
+
+  async function fetchArticleContent(item: NewsItem) {
+    const key = item.link
+
+    if (contentCacheRef.current[key]) return contentCacheRef.current[key]
+    if (pendingContentRef.current[key]) return pendingContentRef.current[key]
+
+    const request = fetch(`${API}/article-content?link=${encodeURIComponent(item.link)}`)
+      .then((response) => response.json())
+      .then((content: ArticleContent) => {
+        contentCacheRef.current[key] = content
+        return content
+      })
+      .finally(() => {
+        delete pendingContentRef.current[key]
+      })
+
+    pendingContentRef.current[key] = request
+    return request
+  }
+
+  async function fetchArticleVideo(item: NewsItem) {
+    const key = item.link
+
+    if (key in videoCacheRef.current) return videoCacheRef.current[key]
+    if (pendingVideoRef.current[key]) return pendingVideoRef.current[key]
+
+    const request = fetch(`${API}/article-video?link=${encodeURIComponent(item.link)}`)
+      .then((response) => response.json())
+      .then(async (video: ArticleVideo | null) => {
+        if (video?.url) {
+          videoCacheRef.current[key] = video
+          return video
+        }
+
+        const fallbackParams = new URLSearchParams({
+          title: item.title,
+          category: item.category,
+          source: item.source,
+          limit: '1',
+        })
+        const fallbackResponse = await fetch(`${API}/youtube-search?${fallbackParams.toString()}`)
+        const fallbackResults = await fallbackResponse.json()
+        const fallbackVideo = Array.isArray(fallbackResults) ? (fallbackResults[0] || null) : null
+
+        videoCacheRef.current[key] = fallbackVideo
+        return fallbackVideo
+      })
+      .finally(() => {
+        delete pendingVideoRef.current[key]
+      })
+
+    pendingVideoRef.current[key] = request
+    return request
+  }
+
+  async function fetchArticleMedia(item: NewsItem) {
+    const key = item.link
+    const requiredMediaCount = getRequiredWatchMediaCount(item)
+    const cachedMedia = mediaCacheRef.current[key]
+
+    if (cachedMedia && cachedMedia.length >= requiredMediaCount) return cachedMedia
+    if (pendingMediaRef.current[key]) return pendingMediaRef.current[key]
+
+    const params = new URLSearchParams({
+      link: item.link,
+      title: item.title,
+      category: item.category,
+      primaryImage: item.image || '',
+    })
+
+    const request = fetch(`${API}/article-media?${params.toString()}`)
+      .then((response) => response.json())
+      .then((media: ArticleMedia[]) => {
+        const nextMedia = (Array.isArray(media) ? media : [])
+          .map((entry) => entry?.url)
+          .filter((url): url is string => Boolean(url))
+        mediaCacheRef.current[key] = nextMedia
+        return nextMedia
+      })
+      .finally(() => {
+        delete pendingMediaRef.current[key]
+      })
+
+    pendingMediaRef.current[key] = request
+    return request
+  }
+
+  async function deepAnalyze(item: NewsItem, idx: number) {
+    const key = getAnalysisKey(item)
+    setAnalysis(analysisCacheRef.current[key] || { idx, loading: true })
+
     try {
-      const r = await fetch("/api/analyze?title=" + encodeURIComponent(item.title) + "&summary=" + encodeURIComponent(item.summary || "") + "&source=" + encodeURIComponent(item.source || ""))
-      const d = await r.json()
-      setAnalysis({ idx, ...d })
-    } catch (e) { console.error(e) }
+      const nextAnalysis = await fetchAnalysis(item, idx)
+      setAnalysis(nextAnalysis)
+    } catch (e) {
+      console.error(e)
+      setAnalysis({ idx, loading: false, tldr: 'AI analysis temporarily unavailable.', keyPoints: [], context: 'Unable to load analysis right now.', sentiment: 'Neutral', readTime: '1 min read' })
+    }
   }
 
   useEffect(() => {
+    let cancelled = false
+
+    if (categoryCacheRef.current[tab]) {
+      startTransition(() => setNews(categoryCacheRef.current[tab]))
+      setLoading(false)
+      return
+    }
+
     setLoading(true)
-    fetch(`${API}/news?category=${encodeURIComponent(tab)}`)
-      .then(r => r.json()).then(setNews).catch(() => setNews([]))
-      .finally(() => setLoading(false))
+    fetchCategory(tab)
+      .then((items) => {
+        if (cancelled) return
+        startTransition(() => setNews(items))
+      })
+      .catch(() => {
+        if (!cancelled) setNews([])
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [tab])
 
-  const open = (url: string) => window.open(url, '_blank')
+  useEffect(() => {
+    if (prefetchedRef.current) return
+    if (!categoryCacheRef.current[tab]?.length) return
+
+    prefetchedRef.current = true
+    const timers = CATEGORIES.filter((category) => category !== tab).map((category, index) => (
+      window.setTimeout(() => {
+        fetchCategory(category).catch(() => {})
+      }, 180 * (index + 1))
+    ))
+
+    return () => timers.forEach(window.clearTimeout)
+  }, [tab, news.length])
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (!window.location.hash.startsWith('#story-')) {
+        setReader(null)
+        setReaderAnalysis(null)
+        window.scrollTo({ top: readerScrollRef.current, behavior: 'auto' })
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  useEffect(() => {
+    if (!reader) return
+
+    let cancelled = false
+    fetchAnalysis(reader.item, reader.idx)
+      .then((nextAnalysis) => {
+        if (!cancelled) setReaderAnalysis(nextAnalysis)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setReaderAnalysis({ idx: reader.idx, loading: false, tldr: 'AI analysis temporarily unavailable.', keyPoints: [], context: 'Unable to load analysis right now.', sentiment: 'Neutral', readTime: '1 min read' })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [reader])
+
+  useEffect(() => {
+    if (!watch) {
+      setWatchAnalysis(null)
+      return
+    }
+
+    let cancelled = false
+    fetchAnalysis(watch.item, watch.idx)
+      .then((nextAnalysis) => {
+        if (!cancelled) setWatchAnalysis(nextAnalysis)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setWatchAnalysis({ idx: watch.idx, loading: false, tldr: 'AI analysis temporarily unavailable.', keyPoints: [], context: 'Unable to load analysis right now.', sentiment: 'Neutral', readTime: '1 min read' })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [watch])
+
+  useEffect(() => {
+    if (!reader) {
+      setReaderContent(null)
+      setReaderContentLoading(false)
+      return
+    }
+  }, [reader])
+
+  useEffect(() => {
+    if (!reader) return
+
+    let cancelled = false
+    const cachedContent = contentCacheRef.current[reader.item.link]
+
+    setReaderContent(cachedContent || null)
+    setReaderContentLoading(!cachedContent)
+
+    fetchArticleContent(reader.item)
+      .then((content) => {
+        if (!cancelled) setReaderContent(content)
+      })
+      .catch(() => {
+        if (!cancelled) setReaderContent({ byline: '', subtitle: '', paragraphs: [] })
+      })
+      .finally(() => {
+        if (!cancelled) setReaderContentLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [reader])
+
+  useEffect(() => {
+    if (!watch) {
+      setWatchContent(null)
+      setWatchContentLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const cachedContent = contentCacheRef.current[watch.item.link]
+
+    setWatchContent(cachedContent || null)
+    setWatchContentLoading(!cachedContent)
+
+    fetchArticleContent(watch.item)
+      .then((content) => {
+        if (!cancelled) setWatchContent(content)
+      })
+      .catch(() => {
+        if (!cancelled) setWatchContent({ byline: '', subtitle: '', paragraphs: [] })
+      })
+      .finally(() => {
+        if (!cancelled) setWatchContentLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [watch])
+
+  useEffect(() => {
+    if (!watch) {
+      setWatchMedia([])
+      return
+    }
+
+    let cancelled = false
+    const cachedMedia = mediaCacheRef.current[watch.item.link] || []
+    setWatchMedia(cachedMedia)
+
+    fetchArticleMedia(watch.item)
+      .then((media) => {
+        if (!cancelled) setWatchMedia(media)
+      })
+      .catch(() => {
+        if (!cancelled) setWatchMedia([])
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [watch])
+
+  useEffect(() => {
+    if (!watch) {
+      setWatchVideo(null)
+      setWatchVideoLoading(false)
+      return
+    }
+
+    let cancelled = false
+    const cachedVideo = Object.prototype.hasOwnProperty.call(videoCacheRef.current, watch.item.link)
+      ? videoCacheRef.current[watch.item.link]
+      : null
+
+    setWatchVideo(cachedVideo)
+    setWatchVideoLoading(!Object.prototype.hasOwnProperty.call(videoCacheRef.current, watch.item.link))
+
+    fetchArticleVideo(watch.item)
+      .then((video) => {
+        if (!cancelled) setWatchVideo(video)
+      })
+      .catch(() => {
+        if (!cancelled) setWatchVideo(null)
+      })
+      .finally(() => {
+        if (!cancelled) setWatchVideoLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [watch])
+
+  const open = (url: string) => window.open(url, '_blank', 'noopener,noreferrer')
   const hero = news[0]
   const pair = news.slice(1, 3)
   const middle = news.slice(3, 7)
-  const rest = news.slice(7)
+  const rest = news.slice(7, 17)
+  const readerItem = reader?.item || null
+  const readerQuote = readerAnalysis?.keyPoints?.[0] || readerAnalysis?.tldr || readerItem?.summary || ''
+  const relatedStories = readerItem ? news.filter((item) => item.id !== readerItem.id).slice(0, 3) : []
+  const readerParagraphs = readerContent?.paragraphs || []
+  const hasFullArticle = readerParagraphs.length >= 4
 
   // Find a good editorial quote from keyPoints
   const quoteItem = news.find(n => n.keyPoints?.[0]?.length > 20)
 
   return (
     <div>
+      {readerItem ? (
+        <article className="reader-shell">
+          <div className="reader-topbar">
+            <button className="reader-back" onClick={closeArticle}>
+              <ArrowLeft size={16} />
+              <span>Back to NewsFlow</span>
+            </button>
+            <button className="reader-source-link" onClick={() => open(readerItem.link)}>
+              <span>Original Story</span>
+              <ArrowUpRight size={15} />
+            </button>
+          </div>
+
+          <div className="reader-headline">
+            <p className="reader-kicker">{readerItem.category} · {readerItem.source}</p>
+            <h1 className="reader-title-display">{readerItem.title}</h1>
+            <p className="reader-deck">{readerContent?.subtitle || readerAnalysis?.tldr || readerItem.summary}</p>
+            <div className="reader-meta-row">
+              <span>{readerItem.time}</span>
+              <span>{readerAnalysis?.readTime || '2 min brief'}</span>
+            </div>
+          </div>
+
+          {getImage(readerItem) && (
+            <div className="reader-visual" data-quality={getImageQuality(readerItem)}>
+              <img className="news-image" src={getImage(readerItem)} alt="" />
+            </div>
+          )}
+
+          <div className="reader-layout">
+            <aside className="reader-aside">
+              <div className="reader-aside-block">
+                <div className="reader-label">Filed Under</div>
+                <p>{readerItem.category}</p>
+              </div>
+              <div className="reader-aside-block">
+                <div className="reader-label">Source</div>
+                <p>{readerItem.source}</p>
+              </div>
+              <div className="reader-aside-block">
+                <div className="reader-label">Published</div>
+                <p>{readerItem.time}</p>
+              </div>
+              <div className="reader-actions">
+                <button className="reader-action" onClick={() => openPodcast(reader.idx)}><Headphones size={15} /> Listen</button>
+                <button className="reader-action" onClick={() => openWatch(readerItem, reader.idx)}><Play size={15} /> Watch</button>
+                <button className="reader-action" onClick={() => deepAnalyze(readerItem, reader.idx)}><Brain size={15} /> Digest</button>
+                <button className="reader-action" onClick={() => open(readerItem.link)}><ArrowUpRight size={15} /> Original</button>
+              </div>
+            </aside>
+
+            <div className="reader-body">
+              <section className="reader-section">
+                <p className="reader-lede">{readerItem.summary}</p>
+                {!!readerContent?.byline && <p className="reader-byline">By {readerContent.byline}</p>}
+              </section>
+
+              {readerQuote && (
+                <blockquote className="reader-quote">“{readerQuote}”</blockquote>
+              )}
+
+              {readerContentLoading && (
+                <div className="reader-content-loading">Pulling the full story from the original article…</div>
+              )}
+
+              {hasFullArticle && (
+                <section className="reader-section reader-full-story">
+                  <h2>Full Story</h2>
+                  <div className="reader-prose">
+                    {readerParagraphs.map((paragraph, index) => (
+                      <p key={`${index}-${paragraph.slice(0, 24)}`}>{paragraph}</p>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {readerAnalysis?.loading ? (
+                <div className="reader-loading">
+                  <Loader2 size={22} style={{ animation: 'spin 1.2s linear infinite', color: '#b8472a' }} />
+                  <p>Preparing the full brief...</p>
+                </div>
+              ) : (
+                <>
+                  <section className="reader-section">
+                    <h2>At a Glance</h2>
+                    <p>{readerAnalysis?.tldr || readerItem.summary}</p>
+                  </section>
+
+                  {!!readerAnalysis?.keyPoints?.length && (
+                    <section className="reader-section reader-notes">
+                      <h2>Field Notes</h2>
+                      <ul>
+                        {readerAnalysis.keyPoints.map((point, index) => (
+                          <li key={index}>{point}</li>
+                        ))}
+                      </ul>
+                    </section>
+                  )}
+
+                  <section className="reader-section">
+                    <h2>Context</h2>
+                    <p>{readerAnalysis?.context || 'This story is part of the current NewsFlow brief and links back to the broader developments shaping today’s cycle.'}</p>
+                  </section>
+                </>
+              )}
+
+              <section className="reader-section reader-source-note">
+                <h2>Source Note</h2>
+                <p>This article card is curated from {readerItem.source}. For the full reported piece, source detail and any live updates, continue to the original publication.</p>
+              </section>
+            </div>
+          </div>
+
+          {relatedStories.length > 0 && (
+            <section className="reader-related">
+              <div className="reader-related-head">
+                <p className="reader-kicker">Continue Reading</p>
+                <h2>More from today’s brief</h2>
+              </div>
+              <div className="reader-related-grid">
+                {relatedStories.map((item) => (
+                  <button key={item.id} className="reader-related-card" onClick={() => openArticle(item, news.indexOf(item))}>
+                    <span className="reader-related-cat">{item.category}</span>
+                    <span className="reader-related-title">{item.title}</span>
+                    <span className="reader-related-meta">{item.source} · {item.time}</span>
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
+        </article>
+      ) : (
+        <>
       {/* Masthead */}
       <header className="masthead">
-        <p className="masthead-kicker">AI · Curated · Daily</p>
         <h1 className="masthead-title">NEWSFLOW</h1>
         <p className="masthead-date">{TODAY}</p>
-      <button onClick={() => setShowPodcast(true)} style={{ position:"fixed", bottom: 20, right: 20, zIndex: 9998, background:"linear-gradient(135deg,#e74c3c,#c0392b)", color:"#fff", border:"none", borderRadius:"50%", width:56, height:56, fontSize:24, cursor:"pointer", boxShadow:"0 4px 20px rgba(0,0,0,0.3)", display:"flex", alignItems:"center", justifyContent:"center" }} title="Listen">🎙️</button></header>
+        <button
+          onClick={() => openPodcast(0)}
+          style={{ position:"fixed", bottom: 20, right: 20, zIndex: 9998, background:"linear-gradient(135deg,#e74c3c,#c0392b)", color:"#fff", border:"none", borderRadius:"50%", width:56, height:56, cursor:"pointer", boxShadow:"0 4px 20px rgba(0,0,0,0.3)", display:"flex", alignItems:"center", justifyContent:"center" }}
+          title="Listen"
+          aria-label="Listen"
+        >
+          <Headphones size={22} strokeWidth={2.2} />
+        </button>
+      </header>
 
       {/* Nav */}
       <nav className="nav">
         {CATEGORIES.map(c => (
-          <button key={c} className={`nav-item ${tab === c ? 'active' : ''}`} onClick={() => setTab(c)}>
+          <button key={c} className={`nav-item ${tab === c ? 'active' : ''}`} onMouseEnter={() => { void fetchCategory(c) }} onFocus={() => { void fetchCategory(c) }} onClick={() => setTab(c)}>
             {c}
           </button>
         ))}
@@ -89,16 +699,15 @@ function App() {
           {/* HERO */}
           {hero && (
             <div className="wrapper">
-              <section className="hero-section" onClick={() => open(hero.link)}>
+              <section className="hero-section" onClick={() => openArticle(hero, 0)}>
                 {getImage(hero) && (
-                  <div className="hero-img"><img src={getImage(hero)} alt="" /></div>
+                  <div className="hero-img" data-quality={getImageQuality(hero)}><img className="news-image" src={getImage(hero)} alt="" /></div>
                 )}
                 <div className="hero-text">
                   <p className="hero-cat">{hero.category}</p>
                   <h2 className="hero-title">{hero.title}</h2>
                   <p className="hero-summary">{hero.summary?.slice(0, 180)}</p>
-                  <p className="hero-meta-line">{hero.source} · {hero.time}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => { setPodcastIdx(0); setShowPodcast(true) }} onDeep={() => deepAnalyze(news[0], 0)} onRead={() => setReadArticle(news[0])} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(0)} onWatch={() => openWatch(news[0], 0)} onDeep={() => deepAnalyze(news[0], 0)} />
                 </div>
               </section>
             </div>
@@ -111,15 +720,14 @@ function App() {
             <div className="wrapper">
               <div className="two-up">
                 {pair.map(item => (
-                  <article key={item.id} className="two-up-item" onClick={() => open(item.link)}>
+                  <article key={item.id} className="two-up-item" onClick={() => openArticle(item, news.indexOf(item))}>
                     {getImage(item) && (
-                      <div className="two-up-img"><img src={getImage(item)} alt="" /></div>
+                      <div className="two-up-img" data-quality={getImageQuality(item)}><img className="news-image" src={getImage(item)} alt="" /></div>
                     )}
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 120)}</p>
-                    <p className="item-meta">{item.source} · {item.time}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => { setPodcastIdx(news.indexOf(item)); setShowPodcast(true) }} onDeep={() => deepAnalyze(item, news.indexOf(item))} onRead={() => setReadArticle(item)} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                   </article>
                 ))}
               </div>
@@ -138,16 +746,15 @@ function App() {
           {middle.length > 0 && (
             <div className="wrapper story-list">
               {middle.map(item => (
-                <article key={item.id} className="story-row" onClick={() => open(item.link)}>
+                <article key={item.id} className="story-row" onClick={() => openArticle(item, news.indexOf(item))}>
                   {getImage(item) ? (
-                    <div className="story-row-img"><img src={getImage(item)} alt="" /></div>
+                    <div className="story-row-img" data-quality={getImageQuality(item)}><img className="news-image" src={getImage(item)} alt="" /></div>
                   ) : <div />}
                   <div className="story-row-text">
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 140)}</p>
-                    <p className="item-meta">{item.source} · {item.time}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => { setPodcastIdx(news.indexOf(item)); setShowPodcast(true) }} onDeep={() => deepAnalyze(item, news.indexOf(item))} onRead={() => setReadArticle(item)} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                   </div>
                 </article>
               ))}
@@ -158,43 +765,89 @@ function App() {
           {rest.length > 0 && (
             <div className="tail-list">
               {rest.map((item, i) => (
-                <article key={item.id} className="tail-item" onClick={() => open(item.link)}>
+                <article key={item.id} className="tail-item" onClick={() => openArticle(item, news.indexOf(item))}>
                   <p className="tail-number">{String(i + 1).padStart(2, '0')}</p>
                   <p className="item-cat">{item.category}</p>
                   <h3 className="item-title" style={{ fontSize: 22 }}>{item.title}</h3>
                   <p className="item-excerpt">{item.summary?.slice(0, 100)}</p>
-                  <p className="item-meta">{item.source} · {item.time}</p>
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                 </article>
               ))}
             </div>
           )}
         </>
       )}
-    {readArticle && (
-      <div style={{ position:'fixed', top:0, left:0, right:0, bottom:0, background:'#faf8f5', zIndex:9997, overflowY:'auto' }}>
-        <div style={{ maxWidth:680, margin:'0 auto', padding:'20px 24px 60px' }}>
-          <button onClick={() => setReadArticle(null)} style={{ background:'none', border:'none', cursor:'pointer', fontSize:14, color:'#888', marginBottom:20, fontFamily:"Outfit,sans-serif" }}>← Back</button>
-          {readArticle.image && <img src={readArticle.image} style={{ width:'100%', borderRadius:12, marginBottom:24, maxHeight:400, objectFit:'cover' }} />}
-          <div style={{ display:'flex', gap:12, marginBottom:12, alignItems:'center' }}>
-            <span style={{ fontSize:12, fontWeight:600, color:'#e74c3c', textTransform:'uppercase', letterSpacing:1, fontFamily:"Outfit,sans-serif" }}>{readArticle.source}</span>
-            <span style={{ fontSize:12, color:'#999' }}>{readArticle.time}</span>
+        </>
+      )}
+    {analysis && (
+      <div
+        style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(72,49,37,0.18)", zIndex:9998, display:"flex", alignItems:"center", justifyContent:"center", padding:20, backdropFilter:"blur(10px)" }}
+        onClick={() => setAnalysis(null)}
+      >
+        <div
+          style={{ position:"relative", overflow:"hidden", background:"linear-gradient(180deg, rgba(255,255,255,0.72), rgba(247,241,235,0.98))", color:"#1a1a1a", borderRadius:24, padding:32, maxWidth:540, width:"100%", fontFamily:"Outfit,sans-serif", border:"1px solid rgba(26,26,26,0.10)", boxShadow:"0 20px 44px rgba(76,51,39,0.16)", minHeight:320 }}
+          onClick={e => e.stopPropagation()}
+        >
+          <div style={{ position:"absolute", inset:0, pointerEvents:"none" }}>
+            <div style={{ position:"absolute", top:-42, right:-36, width:180, height:180, borderRadius:"50%", background:"radial-gradient(circle, rgba(184,71,42,0.13), rgba(184,71,42,0) 72%)" }} />
+            <div style={{ position:"absolute", top:34, left:-48, width:150, height:150, borderRadius:"50%", background:"radial-gradient(circle, rgba(111,141,122,0.11), rgba(111,141,122,0) 72%)" }} />
+            <div style={{ position:"absolute", top:78, left:32, right:32, height:1, background:"linear-gradient(90deg, rgba(111,141,122,0.24), rgba(184,71,42,0.18), rgba(26,26,26,0.04))" }} />
           </div>
-          <h1 style={{ fontSize:28, fontWeight:700, lineHeight:1.3, marginBottom:16, color:'#1a1a2e', fontFamily:"Outfit,sans-serif" }}>{readArticle.title}</h1>
-          <p style={{ fontSize:16, lineHeight:1.8, color:'#444', marginBottom:24, fontFamily:"Inter,sans-serif", fontWeight:300 }}>{readArticle.summary}</p>
-          {readArticle.keyPoints?.length > 0 && (
-            <div style={{ background:'#f0ede8', borderRadius:12, padding:20, marginBottom:24 }}>
-              <div style={{ fontSize:13, fontWeight:600, textTransform:'uppercase', letterSpacing:1, marginBottom:12, color:'#1a1a2e', fontFamily:"Outfit,sans-serif" }}>Key Points</div>
-              {readArticle.keyPoints.map((p, i) => (
-                <div key={i} style={{ fontSize:14, color:'#555', marginBottom:8, paddingLeft:14, borderLeft:'3px solid #e74c3c', lineHeight:1.6, fontFamily:"Inter,sans-serif" }}>{p}</div>
-              ))}
+
+          <div style={{ position:"relative", display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+            <div style={{ fontSize:11, color:"rgba(26,26,26,0.55)", textTransform:"uppercase", letterSpacing:2 }}>AI Digest</div>
+            <button onClick={() => setAnalysis(null)} style={{ background:"none", border:"none", color:"rgba(26,26,26,0.5)", cursor:"pointer", padding:0, display:"flex", alignItems:"center", justifyContent:"center" }} aria-label="Close digest"><X size={14} /></button>
+          </div>
+
+          <div style={{ position:"relative", fontSize:18, fontWeight:700, marginBottom:16, lineHeight:1.35 }}>{news[analysis.idx]?.title}</div>
+
+          {analysis.loading ? (
+            <div style={{ position:"relative", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:14, minHeight:180, color:"#7a6e67" }}>
+              <Loader2 size={26} style={{ animation: 'spin 1.2s linear infinite', color: '#b8472a' }} />
+              <div style={{ fontSize:13, letterSpacing:0.2 }}>Generating analysis...</div>
             </div>
+          ) : (
+            <>
+              <div style={{ position:"relative", display:"flex", gap:10, marginBottom:16, flexWrap:"wrap" }}>
+                <span style={{ background:analysis.sentiment === 'Positive' ? 'rgba(84, 130, 53, 0.09)' : analysis.sentiment === 'Negative' ? 'rgba(165, 74, 55, 0.09)' : 'rgba(26,26,26,0.035)', padding:"4px 10px", borderRadius:999, fontSize:11, fontWeight:400, color:analysis.sentiment === 'Positive' ? 'rgba(84, 130, 53, 0.88)' : analysis.sentiment === 'Negative' ? 'rgba(138, 63, 46, 0.88)' : 'rgba(61,54,50,0.72)', border:analysis.sentiment === 'Positive' ? '1px solid rgba(84, 130, 53, 0.10)' : analysis.sentiment === 'Negative' ? '1px solid rgba(165, 74, 55, 0.10)' : '1px solid rgba(26,26,26,0.05)' }}>{analysis.sentiment}</span>
+                <span style={{ background:"rgba(255,255,255,0.34)", padding:"4px 10px", borderRadius:999, fontSize:11, fontWeight:400, color:"rgba(61,54,50,0.72)", border:"1px solid rgba(26,26,26,0.05)" }}>{analysis.readTime}</span>
+              </div>
+
+              <div style={{ position:"relative", fontSize:13, color:"#514741", marginBottom:16, lineHeight:1.8 }}>{analysis.tldr}</div>
+
+              <div style={{ position:"relative", marginBottom:18, padding:"14px 16px 12px", borderRadius:16, background:"linear-gradient(180deg, rgba(255,255,255,0.36), rgba(255,255,255,0.18))", border:"1px solid rgba(26,26,26,0.05)" }}>
+                <div style={{ fontSize:12, fontWeight:600, marginBottom:10, textTransform:"uppercase", letterSpacing:1, color:"#7a6e67" }}>Key Points</div>
+                <div style={{ display:"grid", gap:8 }}>
+                  {analysis.keyPoints?.map((p: string, i: number) => (
+                    <div key={i} style={{ display:"grid", gridTemplateColumns:"8px minmax(0, 1fr)", alignItems:"start", columnGap:10 }}>
+                      <span style={{ width:5, height:5, borderRadius:"999px", background:"#b8472a", marginTop:8, marginLeft:1 }} />
+                      <span style={{ fontSize:13, color:"#3d3632", lineHeight:1.7 }}>{p}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ position:"relative", padding:"14px 16px 12px", borderRadius:16, background:"linear-gradient(180deg, rgba(255,255,255,0.28), rgba(255,255,255,0.12))", border:"1px solid rgba(26,26,26,0.04)" }}>
+                <div style={{ fontSize:12, fontWeight:600, marginBottom:10, textTransform:"uppercase", letterSpacing:1, color:"#7a6e67" }}>Context</div>
+                <div style={{ fontSize:13, color:"#514741", lineHeight:1.8 }}>{analysis.context}</div>
+              </div>
+
+              {!!news[analysis.idx] && (
+                <button
+                  onClick={() => openArticle(news[analysis.idx], analysis.idx)}
+                  style={{ marginTop:18, border:"none", borderRadius:999, background:"linear-gradient(135deg,#e74c3c,#c0392b)", color:"#fff", padding:"11px 16px", fontSize:12, fontWeight:600, letterSpacing:0.3, cursor:"pointer", boxShadow:"0 10px 24px rgba(192,57,43,0.18)", alignSelf:"flex-start", display:"inline-flex", alignItems:"center", justifyContent:"center", gap:6 }}
+                >
+                  <span>Deep Dive</span>
+                  <ArrowRight size={13} strokeWidth={2.2} />
+                </button>
+              )}
+            </>
           )}
-          <a href={readArticle.link} target="_blank" rel="noopener" style={{ display:'inline-block', background:'#1a1a2e', color:'#fff', padding:'10px 24px', borderRadius:8, textDecoration:'none', fontSize:14, fontFamily:"Outfit,sans-serif", fontWeight:500 }}>Read Full Article →</a>
         </div>
       </div>
     )}
-    {analysis && (<div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.7)", zIndex:9998, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }} onClick={() => setAnalysis(null)}><div style={{ background:"#1a1a2e", color:"#fff", borderRadius:16, padding:32, maxWidth:500, width:"100%", fontFamily:"Outfit,sans-serif" }} onClick={e => e.stopPropagation()}><div style={{ fontSize:11, opacity:0.5, textTransform:"uppercase", letterSpacing:2, marginBottom:8 }}>AI Deep Analysis</div><div style={{ fontSize:18, fontWeight:700, marginBottom:16 }}>{news[analysis.idx]?.title}</div><div style={{ display:"flex", gap:12, marginBottom:16 }}><span style={{ background:"rgba(255,255,255,0.1)", padding:"4px 12px", borderRadius:20, fontSize:12 }}>{analysis.sentiment}</span><span style={{ background:"rgba(255,255,255,0.1)", padding:"4px 12px", borderRadius:20, fontSize:12 }}>{analysis.readTime}</span></div><div style={{ fontSize:13, opacity:0.7, marginBottom:16 }}>{analysis.tldr}</div><div style={{ fontSize:12, fontWeight:600, marginBottom:8, textTransform:"uppercase", letterSpacing:1 }}>Key Points</div>{analysis.keyPoints?.map((p: string, i: number) => (<div key={i} style={{ fontSize:13, opacity:0.8, marginBottom:6, paddingLeft:12, borderLeft:"2px solid #e74c3c" }}>{p}</div>))}<div style={{ fontSize:12, fontWeight:600, marginBottom:8, marginTop:16, textTransform:"uppercase", letterSpacing:1 }}>Context</div><div style={{ fontSize:13, opacity:0.7 }}>{analysis.context}</div><button onClick={() => setAnalysis(null)} style={{ marginTop:20, background:"#e74c3c", color:"#fff", border:"none", padding:"8px 24px", borderRadius:8, cursor:"pointer", fontSize:13 }}>Close</button></div></div>)}
-    {showPodcast && <PodcastPlayer articles={news} startIdx={podcastIdx} onClose={() => setShowPodcast(false)} />}
+    {watch && <WatchPlayer article={watch.item} analysis={watchAnalysis} content={watchContent} contentLoading={watchContentLoading} mediaImages={watchMedia} video={watchVideo} videoLoading={watchVideoLoading} image={getImage(watch.item)} onClose={closeWatch} />}
+    {showPodcast && <PodcastPlayer articles={news} startIdx={podcastIdx} autoPlayToken={podcastAutoPlayToken} onClose={() => setShowPodcast(false)} />}
     </div>
   )
 }
