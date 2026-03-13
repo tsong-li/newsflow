@@ -58,6 +58,8 @@ Set the frontend repository variable:
 
 Then push to `main` again or re-run the GitHub Pages workflow so the frontend rebuild picks up the backend URL.
 
+If you rename the GitHub repository, the Pages workflow now computes the correct `VITE_BASE_PATH` from the repository name automatically. You do not need to edit the workflow just to change `/newsflow/` to a new repo path.
+
 ## Quick verification
 
 After deployment, these URLs should work:
