@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Pause, Play, X } from 'lucide-react'
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from './audioSession'
+import { apiUrl } from './api'
 import { pickTtsVoice } from './ttsVoices'
 
 interface WatchArticle {
@@ -449,7 +450,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     setPlaying(true)
     syncSceneProgress(startIndex, boundedResume, resumeCaptionIndex)
 
-    const audio = new Audio(`/api/tts?text=${encodeURIComponent(scene.narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`)
+    const audio = new Audio(apiUrl(`/api/tts?text=${encodeURIComponent(scene.narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`))
     audioRef.current = audio
     audio.currentTime = 0
     audio.onloadedmetadata = () => {

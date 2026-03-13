@@ -1,5 +1,6 @@
 import PodcastPlayer from './PodcastPlayer'
 import WatchPlayer from './WatchPlayer'
+import { apiUrl } from './api'
 import React, { startTransition, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, ArrowUpRight, Headphones, Play, Brain, Sparkles, Loader2, X } from 'lucide-react'
 
@@ -46,7 +47,7 @@ interface ArticleMedia {
 const WATCH_IMAGE_TARGET = 4
 
 const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'World', 'Science']
-const API = '/api'
+const API = apiUrl('/api')
 function getRequiredWatchMediaCount(item: NewsItem) {
   return Math.max(0, WATCH_IMAGE_TARGET - (item.image ? 1 : 0))
 }
@@ -191,7 +192,7 @@ function App() {
     if (analysisCacheRef.current[key]) return analysisCacheRef.current[key]
     if (pendingAnalysisRef.current[key]) return pendingAnalysisRef.current[key]
 
-    const request = fetch("/api/analyze?title=" + encodeURIComponent(item.title) + "&summary=" + encodeURIComponent(item.summary || "") + "&source=" + encodeURIComponent(item.source || ""))
+    const request = fetch(apiUrl("/api/analyze?title=" + encodeURIComponent(item.title) + "&summary=" + encodeURIComponent(item.summary || "") + "&source=" + encodeURIComponent(item.source || "")))
       .then(r => r.json())
       .then((data) => {
         const nextAnalysis = { idx, loading: false, ...data }

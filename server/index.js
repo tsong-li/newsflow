@@ -6,8 +6,15 @@ const FEEDS = require('./feeds')
 const GTTS = require('gtts')
 require('dotenv').config()
 
+const PORT = Number(process.env.PORT) || 3001
+const HOST = process.env.HOST || '0.0.0.0'
+const CORS_ORIGINS = String(process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+
 const app = express()
-app.use(cors())
+app.use(cors(CORS_ORIGINS.length ? { origin: CORS_ORIGINS } : undefined))
 const parser = new Parser({
   timeout: 7000,
   customFields: {
@@ -1367,6 +1374,21 @@ function warmCategory(category, options = {}) {
   return backgroundWarmers[cacheKey]
 }
 
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'newsflow-api',
+    timestamp: new Date().toISOString(),
+    host: HOST,
+    port: PORT,
+    analysisProvider: hasAzureOpenAIConfig()
+      ? 'azure-openai'
+      : (SILICONFLOW_API_KEY ? 'siliconflow' : 'fallback'),
+    ttsProvider: hasAzureSpeechConfig() ? 'azure-speech' : 'gtts',
+    youtubeSearchEnabled: hasYouTubeDataApiConfig(),
+  })
+})
+
 app.get('/api/news', async (req, res) => {
   const category = req.query.category || 'All'
   const feeds = FEEDS[category] || FEEDS['All']
@@ -1579,8 +1601,8 @@ app.get('/api/tts', async (req, res) => {
   }
 })
 
-app.listen(3001, () => {
-  console.log('📰 NewsFlow API ready on http://localhost:3001')
+app.listen(PORT, HOST, () => {
+  console.log(`📰 NewsFlow API ready on http://${HOST}:${PORT}`)
   void warmCategory('All', { silent: true })
   setInterval(() => {
     void warmCategory('All', { silent: true })

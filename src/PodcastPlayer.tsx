@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { SkipBack, Play, Pause, SkipForward, Minus, X } from "lucide-react"
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from "./audioSession"
+import { apiUrl } from "./api"
 import { pickSequentialTtsVoice } from "./ttsVoices"
 
 interface Article {
@@ -534,7 +535,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
     setPlaying(true)
     setProgress(0)
-    const url = "/api/tts?text=" + encodeURIComponent(script.slice(0, 2000)) + (currentVoice ? "&voice=" + encodeURIComponent(currentVoice.id) : "")
+    const url = apiUrl("/api/tts?text=" + encodeURIComponent(script.slice(0, 2000)) + (currentVoice ? "&voice=" + encodeURIComponent(currentVoice.id) : ""))
     const audio = new Audio(url)
     audioRef.current = audio
     audio.onended = () => {

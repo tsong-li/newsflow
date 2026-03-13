@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: newsflow-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: HOST
+        value: 0.0.0.0
+      - key: CORS_ORIGIN
+        value: https://leightsong.github.io
+      - key: SILICONFLOW_API_KEY
+        sync: false
+      - key: SILICONFLOW_MODEL
+        value: Qwen/Qwen2.5-7B-Instruct
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_DEPLOYMENT
+        sync: false
+      - key: AZURE_OPENAI_API_VERSION
+        value: 2024-10-21
+      - key: AZURE_SPEECH_KEY
+        sync: false
+      - key: AZURE_SPEECH_REGION
+        sync: false
+      - key: AZURE_SPEECH_VOICE
+        value: en-US-AndrewMultilingualNeural
+      - key: AZURE_SPEECH_VOICES
+        value: en-US-JennyNeural,en-US-GuyNeural,en-US-AriaNeural,en-US-DavisNeural,en-US-JaneNeural,en-US-TonyNeural,en-US-SaraNeural,en-US-JasonNeural
+      - key: AZURE_SPEECH_OUTPUT_FORMAT
+        value: audio-24khz-48kbitrate-mono-mp3
+      - key: YOUTUBE_DATA_API_KEY
+        sync: false
