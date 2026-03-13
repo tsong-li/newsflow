@@ -29,11 +29,15 @@ services:
         sync: false
       - key: AZURE_SPEECH_REGION
         sync: false
+      - key: AZURE_SPEECH_ENDPOINT
+        sync: false
       - key: AZURE_SPEECH_VOICE
         value: en-US-AndrewMultilingualNeural
       - key: AZURE_SPEECH_VOICES
         value: en-US-JennyNeural,en-US-GuyNeural,en-US-AriaNeural,en-US-DavisNeural,en-US-JaneNeural,en-US-TonyNeural,en-US-SaraNeural,en-US-JasonNeural
       - key: AZURE_SPEECH_OUTPUT_FORMAT
         value: audio-24khz-48kbitrate-mono-mp3
+      - key: TTS_STRICT_AZURE
+        value: true
       - key: YOUTUBE_DATA_API_KEY
         sync: false

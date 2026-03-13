@@ -20,13 +20,15 @@ Required for current production behavior:
 
 - `SILICONFLOW_API_KEY`
 - `AZURE_SPEECH_KEY`
-- `AZURE_SPEECH_REGION`
+- `AZURE_SPEECH_REGION` or `AZURE_SPEECH_ENDPOINT`
 
 Optional but supported:
 
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_API_KEY`
 - `AZURE_OPENAI_DEPLOYMENT`
+- `AZURE_SPEECH_ENDPOINT`
+- `TTS_STRICT_AZURE`
 - `YOUTUBE_DATA_API_KEY`
 - `CORS_ORIGIN`
 
@@ -38,6 +40,13 @@ Defaults already wired in code:
 - `AZURE_OPENAI_API_VERSION=2024-10-21`
 - `AZURE_SPEECH_VOICE=en-US-AndrewMultilingualNeural`
 - `AZURE_SPEECH_OUTPUT_FORMAT=audio-24khz-48kbitrate-mono-mp3`
+- `TTS_STRICT_AZURE=true` in `render.yaml`
+
+## Azure Speech notes
+
+- `AZURE_SPEECH_REGION` can be either the plain region name like `eastasia` or a full Azure endpoint URL. The server now normalizes both.
+- If you prefer, set `AZURE_SPEECH_ENDPOINT` directly, for example `https://eastasia.tts.speech.microsoft.com/cognitiveservices/v1`.
+- In production, `TTS_STRICT_AZURE=true` is recommended so Azure failures return `502` instead of silently falling back to `gtts`.
 
 ## Render steps
 
@@ -67,6 +76,9 @@ After deployment, these URLs should work:
 - `/api/health`
 - `/api/news?category=All`
 - `/api/tts?text=hello`
+- `/api/tts?text=hello&strictAzure=1`
 
-If `/api/tts` fails, check Azure Speech credentials first.
+If `/api/tts?text=hello&strictAzure=1` fails, check Azure Speech credentials and region/endpoint first.
+If `/api/health` reports `azureSpeechConfigured: false`, Render is missing the speech env vars.
+If `/api/health` reports `azureSpeechConfigured: true` but strict TTS still returns `502`, the key is present but Azure Speech rejected the request.
 If `/api/youtube-search` returns empty data, the YouTube Data API key or Google project permissions are still not configured correctly.

@@ -45,6 +45,7 @@ const pendingYouTubeSearchRequests = {}
 const backgroundWarmers = {}
 const CACHE_TTL = 10 * 60 * 1000
 const ANALYZE_CACHE_TTL = 60 * 60 * 1000
+const TRUE_PATTERN = /^(1|true|yes|on)$/i
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY
 const SILICONFLOW_MODEL = process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
 const AZURE_OPENAI_ENDPOINT = (process.env.AZURE_OPENAI_ENDPOINT || '').replace(/\/+$/, '')
@@ -53,7 +54,8 @@ const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT
 const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21'
 const YOUTUBE_DATA_API_KEY = process.env.YOUTUBE_DATA_API_KEY
 const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY
-const AZURE_SPEECH_REGION = process.env.AZURE_SPEECH_REGION
+const RAW_AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim()
+const RAW_AZURE_SPEECH_ENDPOINT = String(process.env.AZURE_SPEECH_ENDPOINT || '').trim()
 const AZURE_SPEECH_VOICE = process.env.AZURE_SPEECH_VOICE || 'en-US-AndrewMultilingualNeural'
 const DEFAULT_AZURE_SPEECH_VOICES = [
   'en-US-JennyNeural',
@@ -74,6 +76,7 @@ const AZURE_SPEECH_VOICES = Array.from(new Set(
     .concat(DEFAULT_AZURE_SPEECH_VOICES)
 ))
 const AZURE_SPEECH_OUTPUT_FORMAT = process.env.AZURE_SPEECH_OUTPUT_FORMAT || 'audio-24khz-48kbitrate-mono-mp3'
+const TTS_STRICT_AZURE = TRUE_PATTERN.test(String(process.env.TTS_STRICT_AZURE || ''))
 const IMAGE_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
@@ -116,8 +119,60 @@ function hasAzureOpenAIConfig() {
   return Boolean(AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_API_KEY && AZURE_OPENAI_DEPLOYMENT)
 }
 
+function isTruthy(value) {
+  return TRUE_PATTERN.test(String(value || ''))
+}
+
+function extractAzureSpeechRegion(value) {
+  const rawValue = String(value || '').trim()
+  if (!rawValue) return ''
+
+  if (!/^https?:\/\//i.test(rawValue)) {
+    return rawValue
+      .replace(/^https?:\/\//i, '')
+      .split(/[/.]/)[0]
+      .trim()
+      .toLowerCase()
+  }
+
+  try {
+    const parsed = new URL(rawValue)
+    return parsed.hostname.split('.')[0].trim().toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+function normalizeAzureSpeechEndpoint(value) {
+  const rawValue = String(value || '').trim()
+  if (!rawValue) return ''
+
+  try {
+    const parsed = new URL(rawValue)
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '')
+  } catch {
+    return ''
+  }
+}
+
+function resolveAzureSpeechEndpoint(endpointValue, regionValue) {
+  const normalizedEndpoint = normalizeAzureSpeechEndpoint(endpointValue)
+  if (normalizedEndpoint) {
+    return /\/cognitiveservices\/v1$/i.test(normalizedEndpoint)
+      ? normalizedEndpoint
+      : `${normalizedEndpoint}/cognitiveservices/v1`
+  }
+
+  const region = extractAzureSpeechRegion(regionValue)
+  if (!region) return ''
+  return `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`
+}
+
+const AZURE_SPEECH_REGION = extractAzureSpeechRegion(RAW_AZURE_SPEECH_REGION || RAW_AZURE_SPEECH_ENDPOINT)
+const AZURE_SPEECH_ENDPOINT = resolveAzureSpeechEndpoint(RAW_AZURE_SPEECH_ENDPOINT, RAW_AZURE_SPEECH_REGION)
+
 function hasAzureSpeechConfig() {
-  return Boolean(AZURE_SPEECH_KEY && AZURE_SPEECH_REGION)
+  return Boolean(AZURE_SPEECH_KEY && AZURE_SPEECH_ENDPOINT)
 }
 
 function hasYouTubeDataApiConfig() {
@@ -194,7 +249,7 @@ function resolveAzureSpeechVoice(requestedVoice) {
 async function synthesizeAzureSpeech(text, voiceName) {
   const selectedVoice = resolveAzureSpeechVoice(voiceName)
   const ssml = `<?xml version="1.0" encoding="utf-8"?><speak version="1.0" xml:lang="en-US"><voice name="${selectedVoice}"><prosody rate="0%" pitch="0%">${escapeSsml(text)}</prosody></voice></speak>`
-  const resp = await fetch(`https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+  const resp = await fetch(AZURE_SPEECH_ENDPOINT, {
     method: 'POST',
     headers: {
       'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
@@ -1385,6 +1440,10 @@ app.get('/api/health', (req, res) => {
       ? 'azure-openai'
       : (SILICONFLOW_API_KEY ? 'siliconflow' : 'fallback'),
     ttsProvider: hasAzureSpeechConfig() ? 'azure-speech' : 'gtts',
+    azureSpeechConfigured: hasAzureSpeechConfig(),
+    azureSpeechRegion: AZURE_SPEECH_REGION || null,
+    azureSpeechEndpointConfigured: Boolean(AZURE_SPEECH_ENDPOINT),
+    ttsStrictAzure: TTS_STRICT_AZURE,
     youtubeSearchEnabled: hasYouTubeDataApiConfig(),
   })
 })
@@ -1567,6 +1626,7 @@ app.get('/api/article-content', async (req, res) => {
 app.get('/api/tts', async (req, res) => {
   const text = String(req.query.text || '').slice(0, 2000)
   const requestedVoice = String(req.query.voice || '')
+  const strictAzure = TTS_STRICT_AZURE || isTruthy(req.query.strictAzure)
   if (!text) return res.status(400).json({ error: 'text required' })
 
   try {
@@ -1581,12 +1641,20 @@ app.get('/api/tts', async (req, res) => {
         return res.end(audioBuffer)
       } catch (error) {
         console.error('Azure Speech error:', error.message)
+        if (strictAzure) {
+          return res.status(502).json({
+            error: 'Azure Speech failed',
+            provider: 'azure-speech',
+            detail: error.message,
+          })
+        }
       }
     }
 
     const gtts = new GTTS(text, 'en')
     res.setHeader('Content-Type', 'audio/mpeg')
     res.setHeader('X-TTS-Provider', 'gtts')
+    res.setHeader('X-TTS-Fallback-From', 'azure-speech')
     return gtts.stream().on('error', (err) => {
       console.error('gtts error:', err)
       if (!res.headersSent) {
