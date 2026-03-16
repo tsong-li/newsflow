@@ -262,6 +262,26 @@ img { display: block; width: 100%; }
   box-shadow: 0 4px 12px rgba(184,71,42,0.28);
 }
 
+.podcast-floating-icon {
+  display: block;
+}
+
+.podcast-floating-icon-playing {
+  animation: podcastIconPulse 1.6s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@keyframes podcastIconPulse {
+  0%, 100% {
+    opacity: 0.92;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+}
+
 .hero-section:hover .hero-img[data-quality="low"] .news-image,
 .two-up-item:hover .two-up-img[data-quality="low"] .news-image,
 .story-row:hover .story-row-img[data-quality="low"] .news-image,

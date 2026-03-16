@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
-import { SkipBack, Play, Pause, SkipForward, Minus, X } from "lucide-react"
+import { SkipBack, Play, Pause, SkipForward, Minus, X, Headphones, AudioLines } from "lucide-react"
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from "./audioSession"
 import { apiUrl } from "./api"
 import { pickSequentialTtsVoice } from "./ttsVoices"
@@ -985,6 +985,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const panelMuted = "rgba(26,26,26,0.5)"
   const panelSoft = "rgba(26,26,26,0.08)"
   const accent = "#b8472a"
+  const primaryButtonBackground = "linear-gradient(135deg,#e74c3c,#c0392b)"
+  const primaryButtonShadow = "0 8px 20px rgba(192,57,43,0.28)"
   const collapsedStyle: CSSProperties = isMobileViewport
     ? {
         position: "fixed",
@@ -1040,16 +1042,57 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const mb: CSSProperties = { background: "none", border: "none", color: panelMuted, cursor: "pointer", fontSize: 14, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }
   const cb: CSSProperties = { background: panelSoft, border: `1px solid ${panelBorder}`, color: panelText, width: 36, height: 36, borderRadius: "50%", cursor: "pointer", fontSize: 16, display: "flex", alignItems: "center", justifyContent: "center" }
 
+  function replayFromStart() {
+    doStop()
+    resumeProgressRef.current = 0
+    setAudioDurationMs(0)
+    setProgress(0)
+
+    if (isQueueMode) {
+      pendingAutoPlayIdxRef.current = startIdx
+      setIdx(startIdx)
+      setPlaying(true)
+      return
+    }
+
+    pendingAutoPlayIdxRef.current = null
+    setPlaying(true)
+  }
+
+  const isPausedWithResume = !playing && progress > 0 && progress < 100
+
+  function handleCollapsedClick() {
+    if (playing) {
+      setExpanded(true)
+      return
+    }
+
+    if (isPausedWithResume) {
+      setExpanded(true)
+      pendingAutoPlayIdxRef.current = null
+      doPlay(resumeProgressRef.current)
+      return
+    }
+
+    replayFromStart()
+  }
+
   if (!expanded) {
     return (
-      <div onClick={() => setExpanded(true)} style={{
+      <div onClick={handleCollapsedClick} style={{
         ...collapsedStyle,
-        background: playing ? "linear-gradient(135deg,#c85738,#a63f24)" : panelBg,
-        border: `1px solid ${playing ? "rgba(184,71,42,0.35)" : panelBorder}`,
-        color: playing ? "#fff" : panelText, display: "flex", alignItems: "center", justifyContent: "center",
-        cursor: "pointer", boxShadow: "0 10px 28px rgba(76,51,39,0.16)", fontSize: 14, fontWeight: 600
+        background: primaryButtonBackground,
+        border: "1px solid rgba(184,71,42,0.35)",
+        color: "#fff", display: "flex", alignItems: "center", justifyContent: "center",
+        cursor: "pointer", boxShadow: playing ? "0 12px 30px rgba(192,57,43,0.28)" : "0 10px 28px rgba(192,57,43,0.22)", fontSize: 14, fontWeight: 600
       }}>
-        {playing ? "ON" : "TTS"}
+        {playing ? (
+          <AudioLines size={22} strokeWidth={2.1} className="podcast-floating-icon podcast-floating-icon-playing" />
+        ) : isPausedWithResume ? (
+          <Play size={22} strokeWidth={2.1} className="podcast-floating-icon" />
+        ) : (
+          <Headphones size={22} strokeWidth={2.1} className="podcast-floating-icon" />
+        )}
       </div>
     )
   }
@@ -1084,7 +1127,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       </div>
       <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center" }}>
         <button onClick={prev} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipBack size={16} /></button>
-        <button onClick={togglePlay} style={{ ...cb, width: 44, height: 44, fontSize: 14, background: accent, color: "#fff", border: "none", boxShadow: "0 8px 20px rgba(184,71,42,0.28)" }}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
+        <button onClick={togglePlay} style={{ ...cb, width: 44, height: 44, fontSize: 14, background: primaryButtonBackground, color: "#fff", border: "none", boxShadow: primaryButtonShadow }}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
         <button onClick={next} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipForward size={16} /></button>
       </div>
     </div>
