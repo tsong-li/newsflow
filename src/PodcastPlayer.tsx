@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
-import { SkipBack, Play, Pause, SkipForward, Minus, X, Headphones, AudioLines } from "lucide-react"
+import { SkipBack, Play, Pause, SkipForward, Minus, X, Headphones, AudioLines, Timer, ChevronDown } from "lucide-react"
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from "./audioSession"
 import { apiUrl } from "./api"
 import { pickSequentialTtsVoice } from "./ttsVoices"
@@ -41,6 +41,64 @@ interface Props {
 const WEATHER_RESOLVE_TIMEOUT_MS = 1800
 const AUDIO_START_TIMEOUT_MS = 4000
 const SPEECH_WORD_MS = 420
+const TIMER_PRESETS = [5, 15, 20, 30, 45, 60] as const
+const TTS_CHARS_PER_MINUTE = 900
+const COMFORTABLE_CHAR_FLOOR = 650
+const TIGHT_CHAR_FLOOR = 430
+const TIMER_OPTION_COPY: Record<string, { title: string; note: string }> = {
+  full: { title: "Full edit", note: "Sunday paper energy" },
+  "5": { title: "5 min", note: "Mercifully brief" },
+  "15": { title: "15 min", note: "A crisp little brief" },
+  "20": { title: "20 min", note: "Lean, with plot" },
+  "30": { title: "30 min", note: "The well-cut edition" },
+  "45": { title: "45 min", note: "A generous telling" },
+  "60": { title: "60 min", note: "Positively novelistic" },
+}
+
+function getTimerOptionCopy(minutes: number | null) {
+  return TIMER_OPTION_COPY[minutes === null ? "full" : String(minutes)] || { title: `${minutes} min`, note: "Well paced" }
+}
+
+function calcCharBudget(totalMinutes: number, articleCount: number): number {
+  if (articleCount <= 0) return 2000
+  const perArticle = Math.floor((totalMinutes * TTS_CHARS_PER_MINUTE) / Math.max(1, articleCount))
+  return Math.max(200, Math.min(2000, perArticle))
+}
+
+function calcAdaptiveCharBudget(totalMinutes: number, elapsedMs: number, remainingArticles: number, completedArticles: number) {
+  if (remainingArticles <= 0) return 2000
+
+  const totalMs = totalMinutes * 60 * 1000
+  const remainingMs = Math.max(30_000, totalMs - elapsedMs)
+  const remainingMinutes = remainingMs / 60_000
+  const rawPerArticle = calcCharBudget(remainingMinutes, remainingArticles)
+  const remainingCapacity = Math.floor(remainingMinutes * TTS_CHARS_PER_MINUTE)
+  let adjusted = rawPerArticle
+
+  if (remainingCapacity < remainingArticles * COMFORTABLE_CHAR_FLOOR) {
+    adjusted = Math.floor(adjusted * 0.86)
+  }
+
+  if (remainingCapacity < remainingArticles * TIGHT_CHAR_FLOOR) {
+    adjusted = Math.floor(adjusted * 0.72)
+  }
+
+  if (completedArticles > 0) {
+    const idealElapsedMs = totalMs * (completedArticles / (completedArticles + remainingArticles))
+    if (elapsedMs > idealElapsedMs * 1.08) {
+      adjusted = Math.floor(adjusted * 0.84)
+    }
+  }
+
+  return Math.max(200, Math.min(1800, adjusted))
+}
+
+function formatCountdown(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${String(seconds).padStart(2, "0")}`
+}
 
 function clipText(text: string, max = 220) {
   const value = String(text || "").replace(/\s+/g, " ").trim()
@@ -364,9 +422,11 @@ function buildArticleNarration(
   includeTransition: boolean,
   currentVoiceName?: string,
   nextVoiceName?: string,
+  charBudget?: number,
 ) {
   const seed = `${article.title}|${article.source || ""}|${article.category || ""}`
   const tone = getListenTone(article.category)
+  const maxChars = charBudget || tone.max
   const bodyParagraphs = (content?.paragraphs || [])
     .map((paragraph) => normalizeSpeechText(paragraph, 220))
     .filter((paragraph) => paragraph.length > 45)
@@ -397,17 +457,19 @@ function buildArticleNarration(
   const contextLine = contextDetail ? buildContextLine(seed, detailLead, contextDetail) : ""
   const bridgeLine = supporting ? buildBridgeLine(seed, supporting) : ""
 
-  const lines = [
-    includeIntro ? buildIntroLine(weatherContext) : "",
-    openingLine,
-    detail ? `${detailLead} ${toSentence(lowercaseLead(detail))}` : "",
-    bridgeLine,
-    contextLine,
-    closing,
-    includeTransition ? buildTransitionLine(seed, index === total - 1, currentVoiceName, nextVoiceName) : "",
-  ].filter(Boolean)
+  const effectiveIntro = includeIntro && maxChars >= 700
+  const effectiveTransition = includeTransition && maxChars >= 350
 
-  return clipText(lines.join(" "), tone.max)
+  const lines: string[] = []
+  if (effectiveIntro) lines.push(buildIntroLine(weatherContext))
+  lines.push(openingLine)
+  if (maxChars >= 350 && detail) lines.push(`${detailLead} ${toSentence(lowercaseLead(detail))}`)
+  if (maxChars >= 700) { if (bridgeLine) lines.push(bridgeLine) }
+  if (maxChars >= 1200) { if (contextLine) lines.push(contextLine) }
+  if (maxChars >= 1500) lines.push(closing)
+  if (effectiveTransition) lines.push(buildTransitionLine(seed, index === total - 1, currentVoiceName, nextVoiceName))
+
+  return clipText(lines.filter(Boolean).join(" "), maxChars)
 }
 
 export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single', autoPlayToken = 0, onClose }: Props) {
@@ -426,6 +488,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const [contentByLink, setContentByLink] = useState<Record<string, ArticleContent>>({})
   const [loadingByLink, setLoadingByLink] = useState<Record<string, boolean>>({})
   const [failedByLink, setFailedByLink] = useState<Record<string, boolean>>({})
+  const [showTimerOptions, setShowTimerOptions] = useState(false)
+  const [timerMinutes, setTimerMinutes] = useState<number | null>(null)
+  const [timerElapsedMs, setTimerElapsedMs] = useState(0)
+  const [activeCharBudget, setActiveCharBudget] = useState<number | undefined>(undefined)
+  const [handoffCue, setHandoffCue] = useState<{ targetIdx: number; text: string } | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioStartTimerRef = useRef<number | null>(null)
   const speechProgressTimerRef = useRef<number | null>(null)
@@ -435,6 +502,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const audioUrlCacheRef = useRef<Record<string, string>>({})
   const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
   const resumeProgressRef = useRef(0)
+  const timerTickRef = useRef(0)
+  const pendingTimerSwitchRef = useRef<{ targetIdx: number; startRatio: number } | null>(null)
   const sessionIdRef = useRef(createAudioSessionId("listen"))
 
   const current = articles[idx]
@@ -442,6 +511,9 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const visibleCount = isQueueMode ? articles.length : (current ? 1 : 0)
   const shouldPreferBrowserSpeech = String(import.meta.env.VITE_PREFER_BROWSER_TTS || '').toLowerCase() === 'true'
   const currentContent = current?.link ? contentByLink[current.link] || null : null
+  const remainingArticles = isQueueMode ? Math.max(1, articles.length - idx) : 1
+  const completedArticles = isQueueMode ? Math.max(0, idx - startIdx) : 0
+  const charBudget = activeCharBudget
 
   function buildVoiceForIndex(targetIndex: number) {
     const article = articles[targetIndex]
@@ -458,14 +530,14 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     return isQueueMode && targetIndex === startIdx
   }
 
-  function buildTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false) {
-    return apiUrl(
-      "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
-    )
+  function buildTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
+    let url = "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
+    if (maxChars) url += "&maxChars=" + maxChars
+    return apiUrl(url)
   }
 
-  function buildAudioCacheKey(text: string, voiceId?: string, allowGreeting = false) {
-    return `${voiceId || 'default'}::${allowGreeting ? 'greet' : 'plain'}::${text.slice(0, 2000)}`
+  function buildAudioCacheKey(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
+    return `${voiceId || 'default'}::${allowGreeting ? 'greet' : 'plain'}::${maxChars || 'full'}::${text.slice(0, 2000)}`
   }
 
   async function ensureArticleContent(article?: Article | null) {
@@ -494,14 +566,14 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     return request
   }
 
-  async function preloadAudio(text: string, voiceId?: string, allowGreeting = false) {
+  async function preloadAudio(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
     if (shouldPreferBrowserSpeech || !text.trim()) return null
 
-    const cacheKey = buildAudioCacheKey(text, voiceId, allowGreeting)
+    const cacheKey = buildAudioCacheKey(text, voiceId, allowGreeting, maxChars)
     if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
     if (pendingAudioUrlRef.current[cacheKey]) return pendingAudioUrlRef.current[cacheKey]
 
-    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(text, voiceId, allowGreeting))
+    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(text, voiceId, allowGreeting, maxChars))
       .then(async (response) => {
         if (!response.ok) return null
         const audioBlob = await response.blob()
@@ -602,15 +674,31 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     setAudioDurationMs(0)
     setUsingSpeechFallback(false)
     setExpanded(true)
+    setShowTimerOptions(false)
     setIdx(startIdx)
     setProgress(0)
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
     }
+    setTimerMinutes(null)
+    setTimerElapsedMs(0)
+    setActiveCharBudget(undefined)
+    setHandoffCue(null)
     pendingAutoPlayIdxRef.current = startIdx
     setPlaying(true)
   }, [startIdx, autoPlayToken])
+
+  useEffect(() => {
+    if (!timerMinutes) {
+      setActiveCharBudget(undefined)
+      return
+    }
+
+    setActiveCharBudget(
+      calcAdaptiveCharBudget(timerMinutes, timerElapsedMs, remainingArticles, completedArticles),
+    )
+  }, [completedArticles, idx, remainingArticles, timerMinutes])
 
   useEffect(() => {
     void ensureArticleContent(current)
@@ -643,8 +731,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         isQueueMode,
         currentVoice?.label,
         nextVoice?.label,
+        charBudget,
       )
     : ""
+  const activeHandoffCue = handoffCue?.targetIdx === idx ? handoffCue.text : ""
+  const playbackScript = [activeHandoffCue, script].filter(Boolean).join(" ").trim()
 
   useEffect(() => {
     return () => {
@@ -661,11 +752,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
   useEffect(() => {
     if (shouldPreferBrowserSpeech) return
-    if (!current || !script.trim()) return
+    if (!current || !playbackScript.trim()) return
     if (isQueueMode && idx === startIdx && !weatherResolved) return
 
-    void preloadAudio(script, currentVoice?.id, shouldAllowGreeting(idx))
-  }, [current?.link, currentVoice?.id, idx, isQueueMode, script, shouldPreferBrowserSpeech, startIdx, weatherResolved])
+    void preloadAudio(playbackScript, currentVoice?.id, shouldAllowGreeting(idx), charBudget)
+  }, [charBudget, current?.link, currentVoice?.id, idx, isQueueMode, playbackScript, shouldPreferBrowserSpeech, startIdx, weatherResolved])
 
   useEffect(() => {
     if (!isQueueMode || shouldPreferBrowserSpeech) return
@@ -691,15 +782,26 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         true,
         nextCurrentVoice?.label,
         nextFollowingVoice?.label,
+        charBudget,
       )
 
-      void preloadAudio(nextScript, nextCurrentVoice?.id, shouldAllowGreeting(nextIndex))
+      void preloadAudio(nextScript, nextCurrentVoice?.id, shouldAllowGreeting(nextIndex), charBudget)
     })
 
     return () => {
       cancelled = true
     }
-  }, [articles, idx, isQueueMode, shouldPreferBrowserSpeech, startIdx, weatherContext])
+  }, [articles, charBudget, idx, isQueueMode, shouldPreferBrowserSpeech, startIdx, weatherContext])
+
+  useEffect(() => {
+    const pendingSwitch = pendingTimerSwitchRef.current
+    if (!pendingSwitch) return
+    if (pendingSwitch.targetIdx !== idx) return
+    if (isQueueMode && idx === startIdx && !weatherResolved) return
+
+    pendingTimerSwitchRef.current = null
+    doPlay(pendingSwitch.startRatio)
+  }, [idx, startIdx, timerMinutes, weatherResolved, isQueueMode])
 
   useEffect(() => {
     if (!playing) return
@@ -729,6 +831,61 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     setPlaying(false)
     setUsingSpeechFallback(false)
   }), [])
+
+  useEffect(() => {
+    if (!timerMinutes || !playing) {
+      timerTickRef.current = 0
+      return
+    }
+    timerTickRef.current = Date.now()
+    const id = window.setInterval(() => {
+      const now = Date.now()
+      const delta = now - timerTickRef.current
+      timerTickRef.current = now
+      setTimerElapsedMs(prev => prev + delta)
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [timerMinutes, playing])
+
+  const timerRemainingMs = timerMinutes ? Math.max(0, timerMinutes * 60 * 1000 - timerElapsedMs) : 0
+
+  function applyTimerSelection(minutes: number | null) {
+    const currentRatio = Math.max(0, Math.min(1, resumeProgressRef.current || (progress / 100)))
+    const shouldResume = playing
+    const shouldSkipCurrent = isQueueMode && currentRatio > 0.5 && idx < articles.length - 1
+
+    doStop()
+    setAudioDurationMs(0)
+    setTimerMinutes(minutes)
+    setShowTimerOptions(false)
+
+    if (shouldSkipCurrent) {
+      const targetIdx = idx + 1
+      const cueText = buildTransitionLine(
+        `${current.title}|${current.source || ""}|${current.category || ""}`,
+        false,
+        currentVoice?.label,
+        nextVoice?.label,
+      )
+
+      setHandoffCue({ targetIdx, text: cueText })
+      setProgress(0)
+      resumeProgressRef.current = 0
+      pendingAutoPlayIdxRef.current = targetIdx
+      if (shouldResume) {
+        pendingTimerSwitchRef.current = { targetIdx, startRatio: 0 }
+      }
+      setIdx(targetIdx)
+      return
+    }
+
+    setHandoffCue(null)
+    setProgress(Math.max(0, Math.min(100, currentRatio * 100)))
+    resumeProgressRef.current = currentRatio
+    if (shouldResume) {
+      pendingTimerSwitchRef.current = { targetIdx: idx, startRatio: currentRatio }
+    }
+  }
 
   if (!current) return null
 
@@ -792,9 +949,9 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     window.speechSynthesis.cancel()
 
     const boundedRatio = Math.max(0, Math.min(0.98, startRatio))
-    const totalDurationMs = estimateSpeechDurationMs(script)
+    const totalDurationMs = estimateSpeechDurationMs(playbackScript)
     const remainingDurationMs = Math.max(1200, Math.round(totalDurationMs * (1 - boundedRatio)))
-    const spokenText = sliceSpeechFromProgress(script, boundedRatio)
+    const spokenText = sliceSpeechFromProgress(playbackScript, boundedRatio)
     if (!spokenText) {
       advanceToNextStory()
       return
@@ -864,8 +1021,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       playWithSpeechFallback(boundedRatio)
     }
     const allowGreeting = shouldAllowGreeting(idx)
-    const requestUrl = buildTtsRequestUrl(script, currentVoice?.id, allowGreeting)
-    const cacheKey = buildAudioCacheKey(script, currentVoice?.id, allowGreeting)
+    const requestUrl = buildTtsRequestUrl(playbackScript, currentVoice?.id, allowGreeting, charBudget)
+    const cacheKey = buildAudioCacheKey(playbackScript, currentVoice?.id, allowGreeting, charBudget)
 
     const startAudio = (sourceUrl: string) => {
       if (playbackRequestIdRef.current !== playbackRequestId) return
@@ -915,7 +1072,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       fallbackToSpeech()
     }, AUDIO_START_TIMEOUT_MS)
 
-    void (pendingAudioUrlRef.current[cacheKey] || preloadAudio(script, currentVoice?.id, allowGreeting))
+    void (pendingAudioUrlRef.current[cacheKey] || preloadAudio(playbackScript, currentVoice?.id, allowGreeting, charBudget))
       .then((preloadedUrl) => {
         if (audioStartTimerRef.current !== null) {
           window.clearTimeout(audioStartTimerRef.current)
@@ -992,9 +1149,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const collapsedStyle: CSSProperties = isMobileViewport
     ? {
         position: "fixed",
-        bottom: 20,
-        left: "50%",
-        transform: "translateX(-50%)",
+        bottom: "calc(env(safe-area-inset-bottom, 0px) + 18px)",
+        right: "calc(env(safe-area-inset-right, 0px) + 18px)",
         zIndex: 9999,
         width: 60,
         height: 60,
@@ -1002,8 +1158,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       }
     : {
         position: "fixed",
-        bottom: 20,
-        right: 20,
+        bottom: 28,
+        right: 28,
         zIndex: 9999,
         width: 60,
         height: 60,
@@ -1016,7 +1172,9 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         left: "50%",
         transform: "translateX(-50%)",
         zIndex: 9999,
-        width: "min(320px, calc(100vw - 24px))",
+        width: "min(420px, calc(100vw - 40px))",
+        maxWidth: "calc(100vw - 40px)",
+        boxSizing: "border-box",
         borderRadius: 20,
         background: panelBg,
         color: panelText,
@@ -1100,7 +1258,32 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   }
 
   return (
-    <div style={panelStyle}>
+    <>
+      {isQueueMode && isMobileViewport && showTimerOptions ? (
+        <div className="timer-sheet-overlay" onClick={() => setShowTimerOptions(false)}>
+          <div className="timer-sheet" onClick={(event) => event.stopPropagation()}>
+            <div className="timer-sheet-handle" />
+            <div className="timer-sheet-title">Listen duration</div>
+            <div className="timer-sheet-list" role="listbox" aria-label="Listen duration options">
+              {[null, ...TIMER_PRESETS].map((minutes) => {
+                const meta = getTimerOptionCopy(minutes)
+
+                return (
+                  <button
+                    key={minutes === null ? "full" : minutes}
+                    className={`timer-sheet-option${timerMinutes === minutes ? " active" : ""}`}
+                    onClick={() => applyTimerSelection(minutes)}
+                  >
+                    <span className="timer-option-main">{meta.title}</span>
+                    <span className="timer-option-note">{meta.note}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      <div style={panelStyle}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
         <span style={{ fontSize: 11, color: panelMuted, textTransform: "uppercase", letterSpacing: 2 }}>NewsFlow Radio</span>
         <div style={{ display: "flex", gap: 8 }}>
@@ -1109,7 +1292,54 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         </div>
       </div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current.title}</div>
-      <div style={{ fontSize: 11, color: panelMuted, marginBottom: 10 }}>{isQueueMode ? `${idx + 1} / ${articles.length}` : `1 / ${visibleCount || 1}`}</div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, color: panelMuted, marginBottom: 10 }}>
+        <span>{isQueueMode ? `${idx + 1} / ${articles.length}` : `1 / ${visibleCount || 1}`}</span>
+        {isQueueMode ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              className="timer-trigger"
+              onClick={() => setShowTimerOptions((value) => !value)}
+              style={{
+                ...mb,
+                minWidth: 92,
+                minHeight: 30,
+                padding: "6px 10px",
+                borderRadius: 999,
+                border: "1px solid transparent",
+                background: showTimerOptions ? "rgba(26,26,26,0.05)" : "transparent",
+                gap: 6,
+                justifyContent: "space-between",
+                color: panelMuted,
+              }}
+              aria-label="Adjust listen duration"
+            >
+              <Timer size={11} strokeWidth={2} style={{ opacity: 0.82 }} />
+              <span className="timer-pill-value" style={{ fontSize: 10, color: showTimerOptions ? panelText : panelMuted }}>
+                {timerMinutes ? formatCountdown(timerRemainingMs) : "Full edit"}
+              </span>
+              <ChevronDown size={12} strokeWidth={2} style={{ color: showTimerOptions ? panelText : panelMuted, opacity: 0.75 }} />
+            </button>
+          </div>
+        ) : <span />}
+      </div>
+      {isQueueMode && showTimerOptions && !isMobileViewport ? (
+        <div className="timer-dropdown" style={{ marginBottom: 12 }}>
+          {[null, ...TIMER_PRESETS].map((minutes) => {
+            const meta = getTimerOptionCopy(minutes)
+
+            return (
+              <button
+                key={minutes === null ? "full" : minutes}
+                className={`timer-dropdown-item${timerMinutes === minutes ? " active" : ""}`}
+                onClick={() => applyTimerSelection(minutes)}
+              >
+                <span className="timer-option-main">{meta.title}</span>
+                <span className="timer-option-note">{meta.note}</span>
+              </button>
+            )
+          })}
+        </div>
+      ) : null}
       <div style={{ display: "grid", gap: 8, marginBottom: 12 }}>
         <input
           className="podcast-progress-slider"
@@ -1132,6 +1362,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         <button onClick={togglePlay} style={{ ...cb, width: 44, height: 44, fontSize: 14, background: primaryButtonBackground, color: "#fff", border: "none", boxShadow: primaryButtonShadow }}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
         <button onClick={next} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipForward size={16} /></button>
       </div>
-    </div>
+      </div>
+    </>
   )
 }

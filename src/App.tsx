@@ -830,14 +830,16 @@ function App() {
       <header className="masthead">
         <h1 className="masthead-title">NEWSFLOW</h1>
         <p className="masthead-date">{TODAY}</p>
-        <button
-          onClick={() => openPodcast(0, 'queue')}
-          style={{ position:"fixed", bottom: 20, right: 20, zIndex: 9998, background:"linear-gradient(135deg,#e74c3c,#c0392b)", color:"#fff", border:"none", borderRadius:"50%", width:56, height:56, cursor:"pointer", boxShadow:"0 4px 20px rgba(0,0,0,0.3)", display:"flex", alignItems:"center", justifyContent:"center" }}
-          title="Listen"
-          aria-label="Listen"
-        >
-          <Headphones size={22} strokeWidth={2.2} />
-        </button>
+        {!showPodcast && (
+          <button
+            className="listen-fab"
+            onClick={() => openPodcast(0, 'queue')}
+            title="Listen"
+            aria-label="Listen"
+          >
+            <Headphones size={22} strokeWidth={2.2} />
+          </button>
+        )}
       </header>
 
       {/* Nav */}
@@ -951,7 +953,6 @@ function App() {
           <div style={{ position:"absolute", inset:0, pointerEvents:"none" }}>
             <div style={{ position:"absolute", top:-42, right:-36, width:180, height:180, borderRadius:"50%", background:"radial-gradient(circle, rgba(184,71,42,0.13), rgba(184,71,42,0) 72%)" }} />
             <div style={{ position:"absolute", top:34, left:-48, width:150, height:150, borderRadius:"50%", background:"radial-gradient(circle, rgba(111,141,122,0.11), rgba(111,141,122,0) 72%)" }} />
-            <div style={{ position:"absolute", top:78, left:32, right:32, height:1, background:"linear-gradient(90deg, rgba(111,141,122,0.24), rgba(184,71,42,0.18), rgba(26,26,26,0.04))" }} />
           </div>
 
           <div style={{ position:"relative", display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>

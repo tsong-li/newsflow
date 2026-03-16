@@ -258,7 +258,9 @@ async function requestAzureAnalysis(prompt) {
   return parseAnalysisResponse(data.choices?.[0]?.message?.content || '')
 }
 
-async function requestAzureTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen') {
+async function requestAzureTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen', maxChars = 2000) {
+  const charLimit = Math.max(200, Math.min(2000, maxChars))
+  const brevityHint = charLimit < 400 ? ' Be very concise: one or two sentences that capture only the most essential fact.' : charLimit < 800 ? ' Be brief: a few clear sentences with the key facts, no extra context.' : ''
   const styleGuide = mode === 'watch'
     ? 'Rewrite this as natural spoken narration for a short news video scene. Make it sound like a confident human presenter speaking in one take: clear, modern, lightly dynamic, and easy to follow aloud.'
     : 'Rewrite this as natural spoken narration for a podcast-style news host. Make it sound like one smart host talking conversationally: warm, fluid, lightly interpretive, and easy to stay with for a minute or two.'
@@ -299,7 +301,9 @@ async function requestAzureTtsRewrite(text, mode = 'listen', allowGreeting = mod
   return cleanTtsRewriteResponse(data.choices?.[0]?.message?.content || '')
 }
 
-async function requestSiliconFlowTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen') {
+async function requestSiliconFlowTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen', maxChars = 2000) {
+  const charLimit = Math.max(200, Math.min(2000, maxChars))
+  const brevityHint = charLimit < 400 ? ' Be very concise: one or two sentences that capture only the most essential fact.' : charLimit < 800 ? ' Be brief: a few clear sentences with the key facts, no extra context.' : ''
   const styleGuide = mode === 'watch'
     ? 'Rewrite this as natural spoken narration for a short news video scene. Make it sound like a confident human presenter speaking in one take: clear, modern, lightly dynamic, and easy to follow aloud.'
     : 'Rewrite this as natural spoken narration for a podcast-style news host. Make it sound like one smart host talking conversationally: warm, fluid, lightly interpretive, and easy to stay with for a minute or two.'
@@ -322,10 +326,10 @@ async function requestSiliconFlowTtsRewrite(text, mode = 'listen', allowGreeting
         {
           role: 'user',
           content: mode === 'watch'
-            ? `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+            ? `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article.${brevityHint} Keep it under ${charLimit} characters.\n\nOriginal copy:\n${text}`
             : allowGreeting
-              ? `${styleGuide} If the source already starts with a greeting, date line, or weather line, preserve that opening verbatim and only smooth the rest of the narration around it. Do not change the time-of-day greeting or weather facts. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
-              : `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story content. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+              ? `${styleGuide} If the source already starts with a greeting, date line, or weather line, preserve that opening verbatim and only smooth the rest of the narration around it. Do not change the time-of-day greeting or weather facts. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article.${brevityHint} Keep it under ${charLimit} characters.\n\nOriginal copy:\n${text}`
+              : `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story content. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article.${brevityHint} Keep it under ${charLimit} characters.\n\nOriginal copy:\n${text}`
             ,
         },
       ],
@@ -341,12 +345,12 @@ async function requestSiliconFlowTtsRewrite(text, mode = 'listen', allowGreeting
   return cleanTtsRewriteResponse(data.choices?.[0]?.message?.content || '')
 }
 
-async function rewriteTtsNarration(text, mode = 'listen', allowGreeting = mode === 'listen') {
+async function rewriteTtsNarration(text, mode = 'listen', allowGreeting = mode === 'listen', maxChars = 2000) {
   const sourceText = String(text || '').trim()
   if (!sourceText) return ''
   if (!SILICONFLOW_API_KEY && !hasAzureOpenAIConfig()) return sourceText
 
-  const cacheKey = `${mode}::${allowGreeting ? 'greet' : 'plain'}::${sourceText}`
+  const cacheKey = `${mode}::${allowGreeting ? 'greet' : 'plain'}::${maxChars}::${sourceText}`
   if (ttsRewriteCache[cacheKey] && Date.now() - ttsRewriteCache[cacheKey].ts < ANALYZE_CACHE_TTL) {
     return ttsRewriteCache[cacheKey].data
   }
@@ -358,14 +362,14 @@ async function rewriteTtsNarration(text, mode = 'listen', allowGreeting = mode =
 
       if (SILICONFLOW_API_KEY) {
         try {
-          rewritten = await requestSiliconFlowTtsRewrite(sourceText, mode, allowGreeting)
+          rewritten = await requestSiliconFlowTtsRewrite(sourceText, mode, allowGreeting, maxChars)
         } catch (error) {
           console.error('Qwen TTS rewrite error:', error.message)
         }
       }
 
       if (!rewritten && hasAzureOpenAIConfig()) {
-        rewritten = await requestAzureTtsRewrite(sourceText, mode, allowGreeting)
+        rewritten = await requestAzureTtsRewrite(sourceText, mode, allowGreeting, maxChars)
       }
 
       const result = mode === 'watch'
@@ -2001,10 +2005,11 @@ app.get('/api/tts-rewrite', async (req, res) => {
   const text = String(req.query.text || '').slice(0, 2000)
   const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
   const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
+  const maxChars = Math.max(200, Math.min(2000, Number(req.query.maxChars) || 2000))
   if (!text) return res.status(400).json({ error: 'text required' })
 
   try {
-    const rewrittenText = await rewriteTtsNarration(text, rewriteMode, allowGreeting)
+    const rewrittenText = await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars)
     return res.json({ text: rewrittenText })
   } catch (error) {
     console.error('tts rewrite endpoint error:', error.message)
@@ -2026,11 +2031,12 @@ app.get('/api/tts', async (req, res) => {
   const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
   const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
   const strictAzure = TTS_STRICT_AZURE || isTruthy(req.query.strictAzure)
+  const maxChars = Math.max(200, Math.min(2000, Number(req.query.maxChars) || 2000))
   if (!text) return res.status(400).json({ error: 'text required' })
 
   try {
     res.setHeader('Cache-Control', 'no-store')
-    const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting) : text
+    const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars) : text
 
     if (hasAzureSpeechConfig()) {
       try {
