@@ -28,9 +28,13 @@ Optional but supported:
 - `AZURE_OPENAI_API_KEY`
 - `AZURE_OPENAI_DEPLOYMENT`
 - `AZURE_SPEECH_ENDPOINT`
+- `PEXELS_API_KEY`
+- `UNSPLASH_ACCESS_KEY`
 - `TTS_STRICT_AZURE`
 - `YOUTUBE_DATA_API_KEY`
 - `CORS_ORIGIN`
+
+For GitHub Pages, `CORS_ORIGIN` should be the site origin only, not the full repo path. For this repo that means `https://tsong-li.github.io`.
 
 Defaults already wired in code:
 

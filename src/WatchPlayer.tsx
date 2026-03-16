@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Pause, Play, X } from 'lucide-react'
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from './audioSession'
-import { apiUrl } from './api'
+import { apiUrl, proxiedImageUrl } from './api'
 import { pickTtsVoice } from './ttsVoices'
+
+const AUDIO_START_TIMEOUT_MS = 4000
 
 interface WatchArticle {
   title: string
@@ -231,6 +233,12 @@ function buildCaptions(narration: string, durationMs: number): WatchCaption[] {
   })
 }
 
+function isUnavailableAnalysisText(text?: string) {
+  const value = String(text || '').trim().toLowerCase()
+  if (!value) return false
+  return value.includes('ai analysis temporarily unavailable') || value.includes('unable to load analysis right now')
+}
+
 function activeCaptionIndexForElapsed(scene: WatchScene, sceneElapsedMs: number) {
   const nextIndex = scene.captions.findIndex((caption) => sceneElapsedMs >= caption.startMs && sceneElapsedMs < caption.endMs)
   if (nextIndex >= 0) return nextIndex
@@ -253,18 +261,22 @@ function getSceneImageIndex(scene: WatchScene | undefined, sceneIndex: number, s
 function buildScenes(article: WatchArticle, analysis: WatchAnalysis | null, content: WatchContent | null): WatchScene[] {
   const toneSeed = `${article.title}|${article.source || ''}|${article.category || ''}`
   const tone = getWatchTone(article.category)
-  const lead = normalizeSpokenText(analysis?.tldr || content?.subtitle || article.summary || article.title, 170)
-  const points = (analysis?.keyPoints || [])
+  const analysisTldr = !analysis?.loading && !isUnavailableAnalysisText(analysis?.tldr) ? analysis?.tldr : ''
+  const analysisContext = !analysis?.loading && !isUnavailableAnalysisText(analysis?.context) ? analysis?.context : ''
+  const analysisPoints = !analysis?.loading
+    ? (analysis?.keyPoints || []).filter((point) => !isUnavailableAnalysisText(point))
+    : []
+  const lead = normalizeSpokenText(analysisTldr || content?.subtitle || article.summary || article.title, 170)
+  const points = analysisPoints
     .map((point) => normalizeSpokenText(point, 150))
     .filter(Boolean)
     .slice(0, 2)
-  const supportingParagraph = normalizeSpokenText(content?.paragraphs?.find((paragraph) => paragraph.length > 110) || analysis?.context || '', 180)
-  const closer = normalizeSpokenText(analysis?.context || content?.paragraphs?.[1] || article.summary || '', 180)
+  const supportingParagraph = normalizeSpokenText(content?.paragraphs?.find((paragraph) => paragraph.length > 110) || analysisContext || '', 180)
+  const closer = normalizeSpokenText(analysisContext || content?.paragraphs?.[1] || article.summary || '', 180)
   const articleSummary = normalizeSpokenText(article.summary || article.title, 160)
   const backgroundParagraph = normalizeSpokenText(content?.paragraphs?.find((paragraph) => paragraph.length > 80 && paragraph !== supportingParagraph) || '', 170)
   const sourceLine = article.source ? `${article.source} is framing it this way` : 'This is the line the story is moving on'
   const timingLine = article.time ? `The update landed ${article.time.toLowerCase()}` : 'This is still a developing update'
-  const hookOpening = pickVariant(`${toneSeed}:hook-opening`, tone.intro)
   const hookClosing = pickVariant(`${toneSeed}:hook-closing`, tone.hookClose)
   const pointOneOpening = pickVariant(`${toneSeed}:point-1-opening`, tone.pointOne)
   const pointOneClosing = pickVariant(`${toneSeed}:point-1-closing`, [
@@ -286,7 +298,7 @@ function buildScenes(article: WatchArticle, analysis: WatchAnalysis | null, cont
   ])
 
   const hookNarration = buildSpokenNarration(
-    hookOpening,
+    '',
     [lead, points[0] || articleSummary, timingLine],
     hookClosing,
     tone.max,
@@ -358,6 +370,9 @@ function buildScenes(article: WatchArticle, analysis: WatchAnalysis | null, cont
 
 export default function WatchPlayer({ article, analysis, content, contentLoading = false, mediaImages = [], video = null, videoLoading = false, image, onClose }: WatchPlayerProps) {
   const [playing, setPlaying] = useState(false)
+  const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
+  const [audioPreparing, setAudioPreparing] = useState(false)
+  const [sceneDurationOverrides, setSceneDurationOverrides] = useState<Record<string, number>>({})
   const [sceneIndex, setSceneIndex] = useState(0)
   const [elapsedMs, setElapsedMs] = useState(0)
   const [sceneElapsedMs, setSceneElapsedMs] = useState(0)
@@ -367,17 +382,66 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const [imageTransitioning, setImageTransitioning] = useState(false)
   const [frozenImageTransform, setFrozenImageTransform] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioStartTimerRef = useRef<number | null>(null)
+  const speechProgressTimerRef = useRef<number | null>(null)
+  const audioUrlCacheRef = useRef<Record<string, string>>({})
+  const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
   const audioDurationMsRef = useRef<Record<string, number>>({})
   const sceneResumeMsRef = useRef(0)
   const imageTransitionTimerRef = useRef<number | null>(null)
   const liveImageTransformRef = useRef('translate3d(0px, 0, 0) scale(1.03)')
+  const autoplayStartedRef = useRef(false)
   const sessionIdRef = useRef(createAudioSessionId('watch'))
 
-  const scenes = useMemo(() => buildScenes(article, analysis, content), [article, analysis, content])
+  const baseScenes = useMemo(() => buildScenes(article, analysis, content), [article, analysis, content])
+  const shouldPreferBrowserSpeech = String(import.meta.env.VITE_PREFER_BROWSER_TTS || '').toLowerCase() === 'true'
   const watchVoice = useMemo(
     () => pickTtsVoice(`${article.title}|${article.source || ''}|${article.category || ''}`, 'watch'),
     [article],
   )
+
+  const scenes = useMemo(() => baseScenes.map((scene) => {
+    const durationMs = sceneDurationOverrides[scene.id] || scene.durationMs
+    if (durationMs === scene.durationMs) return scene
+
+    return {
+      ...scene,
+      durationMs,
+      captions: buildCaptions(scene.narration, durationMs),
+    }
+  }), [baseScenes, sceneDurationOverrides])
+
+  function buildTtsRequestUrl(narration: string) {
+    return apiUrl(`/api/tts?rewrite=0&mode=watch&text=${encodeURIComponent(narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`)
+  }
+
+  function buildAudioCacheKey(narration: string) {
+    return `${watchVoice.id}::${narration.slice(0, 2000)}`
+  }
+
+  async function preloadSceneAudio(narration: string) {
+    if (shouldPreferBrowserSpeech || !narration.trim()) return null
+
+    const cacheKey = buildAudioCacheKey(narration)
+    if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
+    if (pendingAudioUrlRef.current[cacheKey]) return pendingAudioUrlRef.current[cacheKey]
+
+    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(narration))
+      .then(async (response) => {
+        if (!response.ok) return null
+        const audioBlob = await response.blob()
+        const objectUrl = URL.createObjectURL(audioBlob)
+        audioUrlCacheRef.current[cacheKey] = objectUrl
+        return objectUrl
+      })
+      .catch(() => null)
+      .finally(() => {
+        delete pendingAudioUrlRef.current[cacheKey]
+      })
+
+    return pendingAudioUrlRef.current[cacheKey]
+  }
+
   const sceneStarts = scenes.map((_, index) => scenes.slice(0, index).reduce((total, scene) => total + scene.durationMs, 0))
   const totalMs = scenes.reduce((total, scene) => total + scene.durationMs, 0)
   const currentScene = scenes[sceneIndex] || scenes[0]
@@ -392,10 +456,67 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     return nextImages.filter((url, index) => nextImages.indexOf(url) === index)
   }, [image, mediaImages])
 
+  useEffect(() => {
+    return () => {
+      Object.values(audioUrlCacheRef.current).forEach((url) => {
+        URL.revokeObjectURL(url)
+      })
+      audioUrlCacheRef.current = {}
+    }
+  }, [])
+
+  useEffect(() => {
+    autoplayStartedRef.current = false
+    setSceneDurationOverrides({})
+    audioDurationMsRef.current = {}
+  }, [article.title, article.source, article.category])
+
+  useEffect(() => {
+    if (!currentScene) return
+    void preloadSceneAudio(currentScene.narration)
+  }, [currentScene?.id, currentScene?.narration, shouldPreferBrowserSpeech, watchVoice.id])
+
+  useEffect(() => {
+    if (shouldPreferBrowserSpeech || hasOriginalVideo || !scenes.length) return
+
+    let cancelled = false
+
+    void (async () => {
+      for (const scene of scenes) {
+        if (cancelled) return
+        await preloadSceneAudio(scene.narration)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [hasOriginalVideo, scenes, scriptKey, shouldPreferBrowserSpeech, watchVoice.id])
+
+  useEffect(() => {
+    if (shouldPreferBrowserSpeech) return
+
+    const nextScene = scenes[sceneIndex + 1]
+    if (!nextScene) return
+
+    void preloadSceneAudio(nextScene.narration)
+  }, [sceneIndex, scenes, shouldPreferBrowserSpeech, watchVoice.id])
+
   function stopNarration() {
+    if (audioStartTimerRef.current !== null) {
+      window.clearTimeout(audioStartTimerRef.current)
+      audioStartTimerRef.current = null
+    }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
     }
   }
 
@@ -436,61 +557,183 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     }
 
     setPlaying(false)
+    setAudioPreparing(false)
+    setUsingSpeechFallback(false)
+  }
+
+  function advanceFromScene(startIndex: number, scene: WatchScene) {
+    syncSceneProgress(startIndex, scene.durationMs, Math.max(0, scene.captions.length - 1))
+    if (startIndex < scenes.length - 1) {
+      playScene(startIndex + 1, 0)
+    } else {
+      finishPlayback()
+    }
+  }
+
+  function playSceneWithSpeechFallback(startIndex: number, resumeMs = 0) {
+    const scene = scenes[startIndex]
+    if (!scene) return
+
+    if (!('speechSynthesis' in window)) {
+      setUsingSpeechFallback(false)
+      advanceFromScene(startIndex, scene)
+      return
+    }
+
+    stopNarration()
+    requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
+    setAudioPreparing(false)
+    setUsingSpeechFallback(true)
+
+    const boundedResume = Math.max(0, Math.min(scene.durationMs, resumeMs))
+    setPlaying(true)
+    syncSceneProgress(startIndex, boundedResume, activeCaptionIndexForElapsed(scene, boundedResume))
+
+    const utterance = new SpeechSynthesisUtterance(scene.narration)
+    const availableVoices = window.speechSynthesis.getVoices()
+    const englishVoice = availableVoices.find((voice) => /en-/i.test(voice.lang)) || availableVoices[0]
+    if (englishVoice) utterance.voice = englishVoice
+    utterance.rate = 1
+    utterance.pitch = 1
+
+    const playbackStart = performance.now() - boundedResume
+    speechProgressTimerRef.current = window.setInterval(() => {
+      const elapsed = Math.max(0, Math.min(scene.durationMs, performance.now() - playbackStart))
+      syncSceneProgress(startIndex, elapsed)
+    }, 120)
+
+    utterance.onend = () => {
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      advanceFromScene(startIndex, scene)
+    }
+    utterance.onerror = () => {
+      setUsingSpeechFallback(false)
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      if (startIndex < scenes.length - 1) {
+        playScene(startIndex + 1, 0)
+      } else {
+        finishPlayback()
+      }
+    }
+
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(utterance)
   }
 
   function playScene(startIndex: number, resumeMs = 0) {
     const scene = scenes[startIndex]
     if (!scene) return
 
+    if (shouldPreferBrowserSpeech) {
+      playSceneWithSpeechFallback(startIndex, resumeMs)
+      return
+    }
+
     stopNarration()
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
+    setUsingSpeechFallback(false)
+    setAudioPreparing(true)
     const boundedResume = Math.max(0, Math.min(scene.durationMs, resumeMs))
     const resumeCaptionIndex = activeCaptionIndexForElapsed(scene, boundedResume)
 
-    setPlaying(true)
     syncSceneProgress(startIndex, boundedResume, resumeCaptionIndex)
 
-    const audio = new Audio(apiUrl(`/api/tts?text=${encodeURIComponent(scene.narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`))
-    audioRef.current = audio
-    audio.currentTime = 0
-    audio.onloadedmetadata = () => {
-      if (audio.duration && Number.isFinite(audio.duration)) {
-        audioDurationMsRef.current[scene.id] = audio.duration * 1000
+    const fallbackToSpeech = () => {
+      if (audioStartTimerRef.current !== null) {
+        window.clearTimeout(audioStartTimerRef.current)
+        audioStartTimerRef.current = null
       }
+      if (audioRef.current) audioRef.current = null
+      playSceneWithSpeechFallback(startIndex, boundedResume)
     }
-    audio.ontimeupdate = () => {
-      const actualDurationMs = audioDurationMsRef.current[scene.id] || (audio.duration && Number.isFinite(audio.duration) ? audio.duration * 1000 : scene.durationMs)
-      const progressRatio = actualDurationMs > 0 ? (audio.currentTime * 1000) / actualDurationMs : 0
-      const nextSceneElapsed = Math.min(scene.durationMs, Math.round(progressRatio * scene.durationMs))
-      syncSceneProgress(startIndex, nextSceneElapsed)
-    }
-    audio.onended = () => {
-      syncSceneProgress(startIndex, scene.durationMs, Math.max(0, scene.captions.length - 1))
-      if (startIndex < scenes.length - 1) {
-        playScene(startIndex + 1, 0)
-      } else {
-        finishPlayback()
+
+    const startAudio = (sourceUrl: string) => {
+      const audio = new Audio(sourceUrl)
+      audio.preload = 'auto'
+      audioRef.current = audio
+      audio.currentTime = 0
+      audio.onloadedmetadata = () => {
+        if (audio.duration && Number.isFinite(audio.duration)) {
+          const durationMs = Math.max(1, Math.round(audio.duration * 1000))
+          audioDurationMsRef.current[scene.id] = durationMs
+          setSceneDurationOverrides((current) => current[scene.id] === durationMs ? current : { ...current, [scene.id]: durationMs })
+        }
       }
-    }
-    audio.onerror = () => {
-      if (startIndex < scenes.length - 1) {
-        playScene(startIndex + 1, 0)
-      } else {
-        finishPlayback()
+      audio.oncanplay = () => {
+        if (audioStartTimerRef.current !== null) {
+          window.clearTimeout(audioStartTimerRef.current)
+          audioStartTimerRef.current = null
+        }
+        setAudioPreparing(false)
       }
+      audio.onplaying = () => {
+        setAudioPreparing(false)
+        setPlaying(true)
+      }
+      audio.ontimeupdate = () => {
+        const actualDurationMs = audioDurationMsRef.current[scene.id] || (audio.duration && Number.isFinite(audio.duration) ? audio.duration * 1000 : scene.durationMs)
+        const progressRatio = actualDurationMs > 0 ? (audio.currentTime * 1000) / actualDurationMs : 0
+        const nextSceneElapsed = Math.min(scene.durationMs, Math.round(progressRatio * scene.durationMs))
+        syncSceneProgress(startIndex, nextSceneElapsed)
+      }
+      audio.onended = () => {
+        if (audioStartTimerRef.current !== null) {
+          window.clearTimeout(audioStartTimerRef.current)
+          audioStartTimerRef.current = null
+        }
+        setAudioPreparing(false)
+        advanceFromScene(startIndex, scene)
+      }
+      audio.onerror = () => {
+        setAudioPreparing(false)
+        fallbackToSpeech()
+      }
+      audioStartTimerRef.current = window.setTimeout(() => {
+        fallbackToSpeech()
+      }, AUDIO_START_TIMEOUT_MS)
+      audio.play().catch(() => {
+        fallbackToSpeech()
+      })
     }
-    audio.play().catch(() => {
-      setPlaying(false)
-    })
+
+    const cacheKey = buildAudioCacheKey(scene.narration)
+    const cachedAudioUrl = audioUrlCacheRef.current[cacheKey]
+    if (cachedAudioUrl) {
+      startAudio(cachedAudioUrl)
+      return
+    }
+
+    audioStartTimerRef.current = window.setTimeout(() => {
+      fallbackToSpeech()
+    }, AUDIO_START_TIMEOUT_MS)
+
+    void (pendingAudioUrlRef.current[cacheKey] || preloadSceneAudio(scene.narration))
+      .then((preloadedUrl) => {
+        if (audioStartTimerRef.current !== null) {
+          window.clearTimeout(audioStartTimerRef.current)
+          audioStartTimerRef.current = null
+        }
+        startAudio(preloadedUrl || buildTtsRequestUrl(scene.narration))
+      })
+      .catch(() => {
+        fallbackToSpeech()
+      })
   }
 
   function pausePlayback() {
     stopNarration()
     setPlaying(false)
+    setAudioPreparing(false)
   }
 
   function togglePlayback() {
-    if (playing) {
+    if (playing || audioPreparing) {
       pausePlayback()
       return
     }
@@ -514,32 +757,93 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     if (hasOriginalVideo || videoLoading) {
       stopNarration()
       setPlaying(false)
+      setAudioPreparing(false)
+      autoplayStartedRef.current = false
       return
     }
 
     if (!scenes.length) return
+    if (autoplayStartedRef.current) return
+
+    let cancelled = false
+    autoplayStartedRef.current = true
     sceneResumeMsRef.current = 0
     syncSceneProgress(0, 0, 0)
-    playScene(0, 0)
+
+    if (shouldPreferBrowserSpeech) {
+      playScene(0, 0)
+    } else {
+      setAudioPreparing(true)
+      void preloadSceneAudio(baseScenes[0].narration)
+        .then(() => {
+          if (cancelled) return
+          playScene(0, 0)
+        })
+        .catch(() => {
+          if (cancelled) return
+          playScene(0, 0)
+        })
+    }
 
     return () => {
+      cancelled = true
       stopNarration()
+      setAudioPreparing(false)
     }
-  }, [scriptKey, hasOriginalVideo, videoLoading])
+  }, [article.title, article.source, article.category, hasOriginalVideo, videoLoading, shouldPreferBrowserSpeech, scenes.length])
 
   useEffect(() => subscribeExclusiveAudio(sessionIdRef.current, () => {
     stopNarration()
     setPlaying(false)
+    setAudioPreparing(false)
   }), [])
 
   const progress = totalMs ? Math.min(100, (elapsedMs / totalMs) * 100) : 0
   const sceneProgress = currentScene?.durationMs ? Math.min(100, (sceneElapsedMs / currentScene.durationMs) * 100) : 0
   const activeCaption = currentScene?.captions?.[activeCaptionIndex]
   const currentMotionProgress = currentScene?.durationMs ? (sceneElapsedMs / currentScene.durationMs) : 0
-  const currentMotionShiftX = (currentMotionProgress - 0.5) * 40
-  const currentMotionShiftY = (0.5 - currentMotionProgress) * 18 + sceneIndex * 4
-  const currentMotionRotate = (currentMotionProgress - 0.5) * 1.2
-  const liveImageTransform = `translate3d(${currentMotionShiftX}px, ${currentMotionShiftY}px, 0) scale(${1.08 + sceneIndex * 0.02 + sceneProgress / 420}) rotate(${currentMotionRotate}deg)`
+  const motionProfiles = [
+    {
+      origin: 'center center',
+      startScale: 1.18,
+      scaleDelta: 0.18,
+      shiftX: 22,
+      shiftY: -14,
+      rotate: 0.6,
+    },
+    {
+      origin: 'left center',
+      startScale: 1.16,
+      scaleDelta: 0.13,
+      shiftX: 74,
+      shiftY: 18,
+      rotate: -1.1,
+    },
+    {
+      origin: 'right top',
+      startScale: 1.28,
+      scaleDelta: -0.08,
+      shiftX: -52,
+      shiftY: 34,
+      rotate: 1.4,
+    },
+    {
+      origin: 'center top',
+      startScale: 1.14,
+      scaleDelta: 0.12,
+      shiftX: 34,
+      shiftY: -22,
+      rotate: -0.8,
+    },
+  ] as const
+  const motionProfile = motionProfiles[sceneIndex % motionProfiles.length]
+  const easedMotionProgress = 1 - Math.pow(1 - currentMotionProgress, 1.45)
+  const currentMotionShiftX = motionProfile.shiftX * easedMotionProgress
+  const currentMotionShiftY = motionProfile.shiftY * easedMotionProgress
+  const currentMotionRotate = motionProfile.rotate * easedMotionProgress
+  const currentMotionScale = motionProfile.startScale + motionProfile.scaleDelta * easedMotionProgress
+  const imageTransformOrigin = motionProfile.origin
+  const liveImageTransform = `translate3d(${currentMotionShiftX}px, ${currentMotionShiftY}px, 0) scale(${currentMotionScale}) rotate(${currentMotionRotate}deg)`
   const visualIndex = !hasOriginalVideo && visualImages.length > 1
     ? getSceneImageIndex(currentScene, sceneIndex, scenes.length, visualImages.length)
     : 0
@@ -626,7 +930,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
             ) : (
               <video
                 src={video.url}
-                poster={video.poster || image}
+                poster={proxiedImageUrl(video.poster || '') || image}
                 controls
                 playsInline
                 style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', background: '#000' }}
@@ -635,10 +939,10 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
           ) : (
             <>
               {previousImage && (
-                <img src={previousImage} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', filter: 'brightness(0.62) saturate(1.02)', transform: frozenImageTransform || liveImageTransform, opacity: imageTransitioning ? 0 : 1, transition: 'opacity 520ms ease, transform 520ms ease-out' }} />
+                <img src={previousImage} alt="" decoding="async" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', transformOrigin: imageTransformOrigin, willChange: 'transform, opacity', filter: 'brightness(0.62) saturate(1.05)', transform: frozenImageTransform || liveImageTransform, opacity: imageTransitioning ? 0 : 1, transition: 'opacity 560ms ease, transform 220ms linear' }} />
               )}
-              <img src={displayImage} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', filter: 'brightness(0.62) saturate(1.02)', transform: frozenImageTransform || liveImageTransform, opacity: 1, transition: 'opacity 520ms ease, transform 520ms ease-out' }} />
-              <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(180deg, rgba(17,13,11,0.16), rgba(17,13,11,0.72) 70%, rgba(17,13,11,0.92))' }} />
+              <img src={displayImage} alt="" decoding="async" fetchPriority="high" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', transformOrigin: imageTransformOrigin, willChange: 'transform, opacity', filter: 'brightness(0.62) saturate(1.05)', transform: frozenImageTransform || liveImageTransform, opacity: 1, transition: 'opacity 560ms ease, transform 220ms linear' }} />
+              <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: '42%', background: 'linear-gradient(180deg, rgba(17,13,11,0) 0%, rgba(17,13,11,0.10) 28%, rgba(17,13,11,0.34) 62%, rgba(17,13,11,0.72) 100%)' }} />
             </>
           )}
           <div style={{ position: 'absolute', top: 24, left: 24, right: 24, display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 16 }}>
@@ -647,7 +951,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
             </button>
           </div>
 
-          <div style={{ position: 'absolute', left: 28, right: 28, bottom: 28, display: 'grid', gap: 14 }}>
+          <div style={{ position: 'absolute', left: 28, right: 28, bottom: 20, display: 'grid', gap: 14 }}>
             {hasOriginalVideo ? (
               usingArticleVideo ? null : (
                 <div style={{ maxWidth: 760, display: 'grid', gap: 10 }}>
@@ -660,7 +964,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
                 <div style={{ width: '100%', maxWidth: 760, margin: '0 auto' }}>
                     <div style={{ width: '100%', display: 'grid', gap: 10, maxWidth: 720, margin: '0 auto', justifyItems: 'center' }}>
                     <div style={{ width: '100%', display: 'flex', justifyContent: 'center' }}>
-                      <p style={{ margin: 0, display: 'inline-block', width: 'fit-content', maxWidth: 'min(100%, 700px)', fontSize: 22, lineHeight: 1.35, color: '#fff', textShadow: '0 6px 24px rgba(0,0,0,0.26)', textAlign: 'center', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      <p style={{ margin: 0, display: 'inline-block', width: 'fit-content', maxWidth: 'min(100%, 700px)', fontSize: 22, lineHeight: 1.35, color: '#fff', textShadow: '0 8px 24px rgba(0,0,0,0.34)', textAlign: 'center', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {activeCaption?.text || currentScene?.narration || article.summary || article.title}
                       </p>
                     </div>
@@ -712,8 +1016,8 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
               {!hasOriginalVideo && (
                 <>
                   <button onClick={togglePlayback} style={{ border: 'none', borderRadius: 999, background: 'linear-gradient(135deg,#e74c3c,#c0392b)', color: '#fff', padding: '11px 16px', display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 12, fontWeight: 700, cursor: 'pointer', boxShadow: '0 12px 28px rgba(192,57,43,0.22)' }}>
-                    {playing ? <Pause size={15} /> : <Play size={15} />}
-                    {playing ? 'Pause' : 'Play'}
+                    {playing || audioPreparing ? <Pause size={15} /> : <Play size={15} />}
+                    {playing || audioPreparing ? 'Pause' : 'Play'}
                   </button>
                 </>
               )}

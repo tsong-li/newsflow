@@ -27,6 +27,7 @@ const parser = new Parser({
 
 const cache = {}
 const imageCache = {}
+const imageProxyCache = {}
 const mediaCache = {}
 const videoCache = {}
 const contentCache = {}
@@ -35,7 +36,10 @@ const pageCache = {}
 const pendingNewsRequests = {}
 const analyzeCache = {}
 const pendingAnalyzeRequests = {}
+const ttsRewriteCache = {}
+const pendingTtsRewriteRequests = {}
 const pendingMediaRequests = {}
+const pendingImageProxyRequests = {}
 const pendingVideoRequests = {}
 const pendingContentRequests = {}
 const pendingStockImageRequests = {}
@@ -45,12 +49,16 @@ const pendingYouTubeSearchRequests = {}
 const backgroundWarmers = {}
 const CACHE_TTL = 10 * 60 * 1000
 const ANALYZE_CACHE_TTL = 60 * 60 * 1000
+const EXTERNAL_PAGE_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_PAGE_FETCH_TIMEOUT_MS) || 2500
+const OG_IMAGE_FETCH_TIMEOUT_MS = Number(process.env.OG_IMAGE_FETCH_TIMEOUT_MS) || 1500
 const TRUE_PATTERN = /^(1|true|yes|on)$/i
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY
 const SILICONFLOW_MODEL = process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
+const PEXELS_API_KEY = process.env.PEXELS_API_KEY
+const UNSPLASH_ACCESS_KEY = process.env.UNSPLASH_ACCESS_KEY
 const AZURE_OPENAI_ENDPOINT = (process.env.AZURE_OPENAI_ENDPOINT || '').replace(/\/+$/, '')
 const AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY
-const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT
+const AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || 'Cog-di-askcopilotdatadev'
 const AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-10-21'
 const YOUTUBE_DATA_API_KEY = process.env.YOUTUBE_DATA_API_KEY
 const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY
@@ -81,6 +89,10 @@ const IMAGE_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
 }
+const IMAGE_PROXY_HEADERS = {
+  ...IMAGE_HEADERS,
+  Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+}
 const CATEGORY_FETCH_BUDGETS = {
   All: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 4 },
   Tech: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 4 },
@@ -90,6 +102,7 @@ const CATEGORY_FETCH_BUDGETS = {
   Science: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 3 },
 }
 const STOCK_IMAGE_TARGET = 4
+const MAX_SUPPLEMENTAL_MEDIA_WHEN_ORIGINALS_PRESENT = 2
 const TITLE_STOP_WORDS = new Set([
   'about', 'after', 'amid', 'also', 'and', 'are', 'back', 'been', 'being', 'beyond', 'from', 'have', 'into', 'just', 'more',
   'news', 'over', 'said', 'says', 'still', 'than', 'that', 'their', 'them', 'then', 'they', 'this', 'what', 'when', 'where',
@@ -113,6 +126,28 @@ function parseAnalysisResponse(text) {
   const jsonEnd = clean.lastIndexOf('}')
   const payload = jsonStart >= 0 && jsonEnd >= jsonStart ? clean.slice(jsonStart, jsonEnd + 1) : clean
   return JSON.parse(payload)
+}
+
+function cleanTtsRewriteResponse(text) {
+  return String(text || '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/^['"\s]+|['"\s]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function stripWatchGreeting(text) {
+  return String(text || '')
+    .replace(/^\s*(?:good\s+(?:morning|afternoon|evening)\b[,.!:\-\s]*)+/i, '')
+    .replace(/^\s*(?:hello|hi|hey there|welcome back|thanks for joining us)\b[,.!:\-\s]*/i, '')
+    .trim()
+}
+
+function stripLeadingGreeting(text) {
+  return String(text || '')
+    .replace(/^\s*(?:good\s+(?:morning|afternoon|evening)\b[,.!:\-\s]*)+/i, '')
+    .replace(/^\s*(?:hello|hi|hey there|welcome back|thanks for joining us|and now|now then)\b[,.!:\-\s]*/i, '')
+    .trim()
 }
 
 function hasAzureOpenAIConfig() {
@@ -216,6 +251,135 @@ async function requestAzureAnalysis(prompt) {
 
   const data = await resp.json()
   return parseAnalysisResponse(data.choices?.[0]?.message?.content || '')
+}
+
+async function requestAzureTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen') {
+  const styleGuide = mode === 'watch'
+    ? 'Rewrite this as natural spoken narration for a short news video scene. Make it sound like a confident human presenter speaking in one take: clear, modern, lightly dynamic, and easy to follow aloud.'
+    : 'Rewrite this as natural spoken narration for a podcast-style news host. Make it sound like one smart host talking conversationally: warm, fluid, lightly interpretive, and easy to stay with for a minute or two.'
+
+  const resp = await fetch(`${AZURE_OPENAI_ENDPOINT}/openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=${AZURE_OPENAI_API_VERSION}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': AZURE_OPENAI_API_KEY,
+    },
+    body: JSON.stringify({
+      messages: [
+        {
+          role: 'system',
+          content: mode === 'watch'
+            ? 'You rewrite existing spoken copy for text-to-speech. Preserve every factual claim. Do not add facts. Do not use lists, markdown, labels, quotes, or stage directions. Return plain text only. Prefer short-to-medium sentences with varied rhythm. Remove repetitive framing, stiff transitions, and overly formal wording. Keep it easy to say aloud in one pass.'
+            : 'You rewrite existing spoken copy for text-to-speech. Preserve every factual claim. Do not add facts. Do not use lists, markdown, labels, quotes, or stage directions. Return plain text only. Make it sound like a polished podcast host speaking naturally to listeners, not reading a script. Use smooth transitions, occasional gentle emphasis, and a conversational cadence. Avoid newsroom phrasing, robotic signposting, and repetitive sentence openings. Keep it easy to say aloud in one pass.',
+        },
+        {
+          role: 'user',
+          content: mode === 'watch'
+            ? `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+            : allowGreeting
+              ? `${styleGuide} If the source already starts with a greeting, date line, or weather line, preserve that opening verbatim and only smooth the rest of the narration around it. Do not change the time-of-day greeting or weather facts. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+              : `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story content. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+            ,
+        },
+      ],
+      temperature: 0.55,
+    }),
+  })
+
+  if (!resp.ok) {
+    throw new Error('Azure OpenAI TTS rewrite failed with status ' + resp.status)
+  }
+
+  const data = await resp.json()
+  return cleanTtsRewriteResponse(data.choices?.[0]?.message?.content || '')
+}
+
+async function requestSiliconFlowTtsRewrite(text, mode = 'listen', allowGreeting = mode === 'listen') {
+  const styleGuide = mode === 'watch'
+    ? 'Rewrite this as natural spoken narration for a short news video scene. Make it sound like a confident human presenter speaking in one take: clear, modern, lightly dynamic, and easy to follow aloud.'
+    : 'Rewrite this as natural spoken narration for a podcast-style news host. Make it sound like one smart host talking conversationally: warm, fluid, lightly interpretive, and easy to stay with for a minute or two.'
+
+  const resp = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${SILICONFLOW_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: SILICONFLOW_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: mode === 'watch'
+            ? 'You rewrite existing spoken copy for text-to-speech. Preserve every factual claim. Do not add facts. Do not use lists, markdown, labels, quotes, or stage directions. Return plain text only. Prefer short-to-medium sentences with varied rhythm. Remove repetitive framing, stiff transitions, and overly formal wording. Keep it easy to say aloud in one pass.'
+            : 'You rewrite existing spoken copy for text-to-speech. Preserve every factual claim. Do not add facts. Do not use lists, markdown, labels, quotes, or stage directions. Return plain text only. Make it sound like a polished podcast host speaking naturally to listeners, not reading a script. Use smooth transitions, occasional gentle emphasis, and a conversational cadence. Avoid newsroom phrasing, robotic signposting, and repetitive sentence openings. Keep it easy to say aloud in one pass.',
+        },
+        {
+          role: 'user',
+          content: mode === 'watch'
+            ? `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+            : allowGreeting
+              ? `${styleGuide} If the source already starts with a greeting, date line, or weather line, preserve that opening verbatim and only smooth the rest of the narration around it. Do not change the time-of-day greeting or weather facts. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+              : `${styleGuide} Do not add any greeting, welcome line, time-of-day opener, or host intro such as "good morning" or "good evening". Start directly with the story content. Keep the meaning and roughly the same length, but make the phrasing more human. Avoid sounding like a template, a list, or a written article. Keep it under 2000 characters.\n\nOriginal copy:\n${text}`
+            ,
+        },
+      ],
+      temperature: 0.55,
+    }),
+  })
+
+  if (!resp.ok) {
+    throw new Error('SiliconFlow TTS rewrite failed with status ' + resp.status)
+  }
+
+  const data = await resp.json()
+  return cleanTtsRewriteResponse(data.choices?.[0]?.message?.content || '')
+}
+
+async function rewriteTtsNarration(text, mode = 'listen', allowGreeting = mode === 'listen') {
+  const sourceText = String(text || '').trim()
+  if (!sourceText) return ''
+  if (!SILICONFLOW_API_KEY && !hasAzureOpenAIConfig()) return sourceText
+
+  const cacheKey = `${mode}::${allowGreeting ? 'greet' : 'plain'}::${sourceText}`
+  if (ttsRewriteCache[cacheKey] && Date.now() - ttsRewriteCache[cacheKey].ts < ANALYZE_CACHE_TTL) {
+    return ttsRewriteCache[cacheKey].data
+  }
+  if (pendingTtsRewriteRequests[cacheKey]) return pendingTtsRewriteRequests[cacheKey]
+
+  pendingTtsRewriteRequests[cacheKey] = (async () => {
+    try {
+      let rewritten = ''
+
+      if (SILICONFLOW_API_KEY) {
+        try {
+          rewritten = await requestSiliconFlowTtsRewrite(sourceText, mode, allowGreeting)
+        } catch (error) {
+          console.error('Qwen TTS rewrite error:', error.message)
+        }
+      }
+
+      if (!rewritten && hasAzureOpenAIConfig()) {
+        rewritten = await requestAzureTtsRewrite(sourceText, mode, allowGreeting)
+      }
+
+      const result = mode === 'watch'
+        ? stripWatchGreeting(rewritten || sourceText)
+        : allowGreeting
+          ? (rewritten || sourceText)
+          : stripLeadingGreeting(rewritten || sourceText)
+      ttsRewriteCache[cacheKey] = { ts: Date.now(), data: result }
+      return result
+    } catch (error) {
+      console.error('TTS rewrite error:', error.message)
+      ttsRewriteCache[cacheKey] = { ts: Date.now(), data: sourceText }
+      return sourceText
+    } finally {
+      delete pendingTtsRewriteRequests[cacheKey]
+    }
+  })()
+
+  return pendingTtsRewriteRequests[cacheKey]
 }
 
 async function requestSiliconFlowAnalysis(prompt) {
@@ -903,14 +1067,89 @@ function ensureDistinctMediaTarget(items, count, options = {}) {
   return normalizedItems.concat(fallbackItems).slice(0, neededCount)
 }
 
-async function searchCommonsImages(query, limit = 8) {
+async function searchUnsplashImages(query, limit = 8) {
+  const normalizedQuery = sanitizeSearchText(query || '')
+  if (!normalizedQuery) return []
+
+  if (!UNSPLASH_ACCESS_KEY) {
+    return []
+  }
+
+  const searchUrl = new URL('https://api.unsplash.com/search/photos')
+  searchUrl.searchParams.set('query', normalizedQuery)
+  searchUrl.searchParams.set('per_page', String(Math.max(1, Math.min(limit, 30))))
+  searchUrl.searchParams.set('orientation', 'landscape')
+  searchUrl.searchParams.set('content_filter', 'high')
+
+  const resp = await fetch(searchUrl.toString(), {
+    headers: {
+      ...IMAGE_HEADERS,
+      Authorization: `Client-ID ${UNSPLASH_ACCESS_KEY}`,
+      'Accept-Version': 'v1',
+    },
+  })
+
+  if (!resp.ok) {
+    throw new Error('Unsplash image search failed with status ' + resp.status)
+  }
+
+  const data = await resp.json()
+  return (data?.results || [])
+    .map((item) => ({
+      url: normalizeImageUrl(item?.urls?.regular || item?.urls?.full || item?.urls?.raw || ''),
+      width: Number(item?.width || 0),
+      height: Number(item?.height || 0),
+      title: String(item?.alt_description || item?.description || normalizedQuery),
+    }))
+    .filter((item) => isEditorialImage(item.url))
+    .filter((item) => item.width >= 1000 || item.height >= 700)
+    .filter((item) => item.width === 0 || item.height === 0 || item.width / Math.max(item.height, 1) >= 1.15)
+}
+
+async function searchPexelsImages(query, limit = 8) {
+  const normalizedQuery = sanitizeSearchText(query || '')
+  if (!normalizedQuery || !PEXELS_API_KEY) return []
+
+  const searchUrl = new URL('https://api.pexels.com/v1/search')
+  searchUrl.searchParams.set('query', normalizedQuery)
+  searchUrl.searchParams.set('per_page', String(Math.max(1, Math.min(limit, 30))))
+  searchUrl.searchParams.set('orientation', 'landscape')
+
+  const resp = await fetch(searchUrl.toString(), {
+    headers: {
+      ...IMAGE_HEADERS,
+      Authorization: PEXELS_API_KEY,
+    },
+  })
+
+  if (!resp.ok) {
+    throw new Error('Pexels image search failed with status ' + resp.status)
+  }
+
+  const data = await resp.json()
+  return (data?.photos || [])
+    .map((item) => ({
+      url: normalizeImageUrl(item?.src?.landscape || item?.src?.large2x || item?.src?.large || item?.src?.original || ''),
+      width: Number(item?.width || 0),
+      height: Number(item?.height || 0),
+      title: String(item?.alt || normalizedQuery),
+    }))
+    .filter((item) => isEditorialImage(item.url))
+    .filter((item) => item.width >= 1000 || item.height >= 700)
+    .filter((item) => item.width === 0 || item.height === 0 || item.width / Math.max(item.height, 1) >= 1.15)
+}
+
+async function searchWikimediaCommonsImages(query, limit = 8) {
+  const normalizedQuery = sanitizeSearchText(query || '')
+  if (!normalizedQuery) return []
+
   const resp = await fetch(
-    `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${query} filetype:bitmap -logo -flag -icon -map -diagram`)}&gsrlimit=${limit}&prop=imageinfo&iiprop=url|size&iiurlwidth=2000&format=json&origin=*`,
+    `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(`${normalizedQuery} filetype:bitmap -logo -flag -icon -map -diagram`)}&gsrlimit=${limit}&prop=imageinfo&iiprop=url|size&iiurlwidth=2000&format=json&origin=*`,
     { headers: IMAGE_HEADERS }
   )
 
   if (!resp.ok) {
-    throw new Error('Commons image search failed with status ' + resp.status)
+    throw new Error('Wikimedia Commons image search failed with status ' + resp.status)
   }
 
   const data = await resp.json()
@@ -924,7 +1163,7 @@ async function searchCommonsImages(query, limit = 8) {
         url,
         width: Number(info?.thumbwidth || info?.width || 0),
         height: Number(info?.thumbheight || info?.height || 0),
-        title: String(page?.title || ''),
+        title: String(page?.title || normalizedQuery),
       }
     })
     .filter((item) => isEditorialImage(item.url))
@@ -956,20 +1195,29 @@ async function getSupplementalStockImages(title, category, count, excludeUrls = 
       const queries = buildStockImageQueries(title, category)
       const chosen = []
       const seen = new Set(normalizedExclude)
+      const providers = [
+        { name: 'pexels', search: searchPexelsImages },
+        { name: 'unsplash', search: searchUnsplashImages },
+        { name: 'wikimedia-commons', search: searchWikimediaCommonsImages },
+      ]
 
       for (const query of queries) {
         if (chosen.length >= neededCount) break
 
-        try {
-          const results = await searchCommonsImages(query, 10)
-          for (const result of results) {
-            if (!result.url || seen.has(result.url)) continue
-            seen.add(result.url)
-            chosen.push({ url: result.url, caption: '' })
-            if (chosen.length >= neededCount) break
+        for (const provider of providers) {
+          if (chosen.length >= neededCount) break
+
+          try {
+            const results = await provider.search(query, 10)
+            for (const result of results) {
+              if (!result.url || seen.has(result.url)) continue
+              seen.add(result.url)
+              chosen.push({ url: result.url, caption: '' })
+              if (chosen.length >= neededCount) break
+            }
+          } catch (error) {
+            console.warn(`${provider.name} image search failed for query`, query, error.message)
           }
-        } catch (error) {
-          console.warn('stock image search failed for query', query, error.message)
         }
       }
 
@@ -1076,7 +1324,7 @@ async function getArticlePage(link) {
 
   pendingPageRequests[link] = (async () => {
     try {
-      const resp = await fetch(link, { headers: IMAGE_HEADERS })
+      const resp = await fetchWithTimeout(link, { headers: IMAGE_HEADERS }, EXTERNAL_PAGE_FETCH_TIMEOUT_MS)
       if (!resp.ok) return null
 
       const page = {
@@ -1095,6 +1343,45 @@ async function getArticlePage(link) {
   })()
 
   return pendingPageRequests[link]
+}
+
+async function getProxiedImage(url) {
+  if (!url) return null
+
+  const normalizedUrl = normalizeImageUrl(url)
+  if (!normalizedUrl || !/^https?:/i.test(normalizedUrl)) return null
+
+  if (imageProxyCache[normalizedUrl] && Date.now() - imageProxyCache[normalizedUrl].ts < CACHE_TTL) {
+    return imageProxyCache[normalizedUrl]
+  }
+  if (pendingImageProxyRequests[normalizedUrl]) return pendingImageProxyRequests[normalizedUrl]
+
+  pendingImageProxyRequests[normalizedUrl] = (async () => {
+    try {
+      const response = await fetchWithTimeout(normalizedUrl, { headers: IMAGE_PROXY_HEADERS }, EXTERNAL_PAGE_FETCH_TIMEOUT_MS)
+      if (!response.ok) return null
+
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+      if (!contentType.startsWith('image/')) return null
+
+      const result = {
+        ts: Date.now(),
+        contentType,
+        buffer: Buffer.from(await response.arrayBuffer()),
+        etag: response.headers.get('etag') || '',
+      }
+
+      imageProxyCache[normalizedUrl] = result
+      return result
+    } catch (error) {
+      console.warn('image proxy fetch failed for', normalizedUrl, error.message)
+      return null
+    } finally {
+      delete pendingImageProxyRequests[normalizedUrl]
+    }
+  })()
+
+  return pendingImageProxyRequests[normalizedUrl]
 }
 
 function extractArticleMediaFromHtml(html, pageUrl) {
@@ -1165,7 +1452,10 @@ async function getArticleMedia(link, options = {}) {
       const dedupedOriginals = [primaryImage, ...media.map((item) => normalizeImageUrl(item.url))]
         .filter(Boolean)
         .filter((url, index, collection) => collection.indexOf(url) === index)
-      const missingCount = Math.max(0, STOCK_IMAGE_TARGET - dedupedOriginals.length)
+      const rawMissingCount = Math.max(0, STOCK_IMAGE_TARGET - dedupedOriginals.length)
+      const missingCount = dedupedOriginals.length > 0
+        ? Math.min(rawMissingCount, MAX_SUPPLEMENTAL_MEDIA_WHEN_ORIGINALS_PRESENT)
+        : rawMissingCount
       let supplemental = []
 
       if (missingCount > 0 && options.title) {
@@ -1274,7 +1564,7 @@ async function extractOgImage(link) {
   }
 
   try {
-    const resp = await fetch(link, { headers: IMAGE_HEADERS })
+    const resp = await fetchWithTimeout(link, { headers: IMAGE_HEADERS }, OG_IMAGE_FETCH_TIMEOUT_MS)
     if (!resp.ok) return null
 
     const html = await resp.text()
@@ -1309,6 +1599,18 @@ async function resolveArticleImage(item, options = {}) {
 
   const ogImage = await extractOgImage(item.link)
   return ogImage || feedImage
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 0) {
+  const normalizedTimeout = Math.max(0, Number(timeoutMs) || 0)
+  if (!normalizedTimeout) {
+    return fetch(url, options)
+  }
+
+  return fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(normalizedTimeout),
+  })
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -1561,6 +1863,28 @@ app.get('/api/article-media', async (req, res) => {
   }
 })
 
+app.get('/api/image', async (req, res) => {
+  const url = String(req.query.url || '')
+  if (!url) return res.status(400).json({ error: 'url required' })
+
+  try {
+    const proxied = await getProxiedImage(url)
+    if (!proxied?.buffer) {
+      return res.status(502).json({ error: 'image fetch failed' })
+    }
+
+    if (proxied.etag) {
+      res.setHeader('ETag', proxied.etag)
+    }
+    res.setHeader('Content-Type', proxied.contentType)
+    res.setHeader('Cache-Control', 'public, max-age=600, stale-while-revalidate=1800')
+    return res.end(proxied.buffer)
+  } catch (error) {
+    console.error('image proxy error:', error.message)
+    return res.status(502).json({ error: 'image proxy failed' })
+  }
+})
+
 app.get('/api/stock-images', async (req, res) => {
   const title = String(req.query.title || '')
   const category = String(req.query.category || '')
@@ -1615,6 +1939,21 @@ app.get('/api/article-content', async (req, res) => {
   if (!link) return res.status(400).json({ error: 'link required' })
 
   try {
+
+app.get('/api/tts-rewrite', async (req, res) => {
+  const text = String(req.query.text || '').slice(0, 2000)
+  const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
+  const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
+  if (!text) return res.status(400).json({ error: 'text required' })
+
+  try {
+    const rewrittenText = await rewriteTtsNarration(text, rewriteMode, allowGreeting)
+    return res.json({ text: rewrittenText })
+  } catch (error) {
+    console.error('tts rewrite endpoint error:', error.message)
+    return res.json({ text })
+  }
+})
     return res.json(await getArticleContent(link))
   } catch (error) {
     console.error('article content error:', error.message)
@@ -1626,18 +1965,23 @@ app.get('/api/article-content', async (req, res) => {
 app.get('/api/tts', async (req, res) => {
   const text = String(req.query.text || '').slice(0, 2000)
   const requestedVoice = String(req.query.voice || '')
+  const rewriteRequested = !['0', 'false', 'no', 'off'].includes(String(req.query.rewrite || '').toLowerCase())
+  const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
+  const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
   const strictAzure = TTS_STRICT_AZURE || isTruthy(req.query.strictAzure)
   if (!text) return res.status(400).json({ error: 'text required' })
 
   try {
     res.setHeader('Cache-Control', 'no-store')
+    const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting) : text
 
     if (hasAzureSpeechConfig()) {
       try {
-        const { audioBuffer, voiceName } = await synthesizeAzureSpeech(text, requestedVoice)
+        const { audioBuffer, voiceName } = await synthesizeAzureSpeech(spokenText, requestedVoice)
         res.setHeader('Content-Type', 'audio/mpeg')
         res.setHeader('X-TTS-Provider', 'azure-speech')
         res.setHeader('X-TTS-Voice', voiceName)
+        res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
         return res.end(audioBuffer)
       } catch (error) {
         console.error('Azure Speech error:', error.message)
@@ -1651,10 +1995,11 @@ app.get('/api/tts', async (req, res) => {
       }
     }
 
-    const gtts = new GTTS(text, 'en')
+  const gtts = new GTTS(spokenText, 'en')
     res.setHeader('Content-Type', 'audio/mpeg')
     res.setHeader('X-TTS-Provider', 'gtts')
     res.setHeader('X-TTS-Fallback-From', 'azure-speech')
+  res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
     return gtts.stream().on('error', (err) => {
       console.error('gtts error:', err)
       if (!res.headersSent) {

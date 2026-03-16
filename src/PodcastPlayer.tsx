@@ -33,9 +33,13 @@ interface WeatherResolution {
 interface Props {
   articles: Article[]
   startIdx?: number
+  mode?: 'queue' | 'single'
   autoPlayToken?: number
   onClose: () => void
 }
+
+const WEATHER_RESOLVE_TIMEOUT_MS = 1800
+const AUDIO_START_TIMEOUT_MS = 4000
 
 function clipText(text: string, max = 220) {
   const value = String(text || "").replace(/\s+/g, " ").trim()
@@ -79,86 +83,86 @@ function getListenTone(category?: string) {
   if (/sports/.test(value)) {
     return {
       opening: [
-        "Here is the quick read on this one",
-        "This one moved fast",
-        "The short sports version is this",
+        "This one is worth a closer listen",
+        "There is a lot packed into this one",
+        "Let me walk you through this sports story",
       ],
       detail: [
-        "The swing point is that",
-        "What changed quickly is that",
-        "The key turn is that",
+        "The turning point here is that",
+        "What really shifted is that",
+        "The part that changes the feel of the story is that",
       ],
       closing: [
-        "That is the part to watch going into the next phase.",
-        "That is the part carrying the momentum now.",
+        "That is the part that gives this story its momentum.",
+        "That is the piece to keep in mind as this keeps moving.",
       ],
-      max: 1500,
+      max: 1650,
     }
   }
 
   if (/business|market|finance/.test(value)) {
     return {
       opening: [
-        "The market read is this",
-        "Here is the business version in plain English",
-        "The core signal here is this",
+        "Here is the business story in plain English",
+        "This one gets interesting pretty quickly",
+        "The clearest way into this business story is this",
       ],
       detail: [
         "What matters underneath that is",
-        "The practical read-through is that",
-        "What investors would hear in that is",
+        "The practical takeaway here is that",
+        "The next layer to understand is that",
       ],
       closing: [
-        "That is the part likely to shape the next reaction.",
-        "That is the key read-through from here.",
+        "That is the part likely to shape what happens next.",
+        "That is the takeaway that really lingers after the headline.",
       ],
-      max: 1600,
+      max: 1780,
     }
   }
 
   if (/tech|science/.test(value)) {
     return {
       opening: [
-        "The main development here is this",
-        "At a high level, this is what changed",
-        "The calm read on this story is this",
         "The clearest way into this story is this",
-        "If you strip away the noise, this is the core update",
-        "The important shift underneath the headline is this",
-        "Start with the central development",
+        "Once you strip away the noise, here is what changed",
+        "The real story here starts with this shift",
+        "This one sounds technical, but the core idea is pretty direct",
+        "Let us start with the part that actually matters",
+        "Under the headline, this is the change to pay attention to",
+        "The interesting part of this story is not the headline, it is this",
       ],
       detail: [
-        "The important detail is that",
-        "What matters structurally is that",
-        "The deeper point here is that",
+        "The detail that matters most is that",
+        "What makes this more interesting is that",
+        "The deeper point underneath all of this is that",
       ],
       closing: [
-        "That is the part that matters beyond the headline.",
-        "That is the thread worth carrying into the next update.",
+        "That is the part that matters long after the headline fades.",
+        "That is the thread worth carrying with you into the next update.",
       ],
-      max: 1750,
+      max: 1920,
     }
   }
 
   return {
     opening: [
-      "The short version is this",
-      "What is happening here is fairly direct",
-      "Here is what stands out in this story",
-      "The cleanest way to read this is as follows",
-      "The first thing to know here is this",
-      "The story really starts here",
+      "The clearest way into this story is this",
+      "Here is what really stands out once you get into it",
+      "The story starts to make sense when you look at it this way",
+      "What jumps out first is this",
+      "The useful way to hear this story is as follows",
+      "Let us start with the part doing most of the work here",
     ],
     detail: [
-      "What matters is that",
-      "In practical terms,",
-      "What this seems to mean is",
+      "What matters here is that",
+      "Put simply,",
+      "What this starts to mean in practice is that",
     ],
     closing: [
-      "That is the thread worth watching next.",
-      "That is the angle to keep in mind going forward.",
+      "That is the thread worth keeping in mind from here.",
+      "That is the angle that stays with the story going forward.",
     ],
-    max: 1700,
+    max: 1820,
   }
 }
 
@@ -297,6 +301,30 @@ function buildOpeningLine(seed: string, opening: string, lead: string, title: st
   ])
 }
 
+function buildContextLine(seed: string, detailLead: string, text: string) {
+  const spokenText = toSentence(lowercaseLead(text))
+  if (!spokenText) return ""
+
+  return pickVariant(`${seed}:context-line`, [
+    `${detailLead} ${spokenText}`,
+    `${detailLead} one layer deeper, ${lowercaseLead(spokenText)}`,
+    `Another important detail is this. ${spokenText}`,
+    `A little more context helps here. ${spokenText}`,
+  ])
+}
+
+function buildBridgeLine(seed: string, text: string) {
+  const spokenText = toSentence(lowercaseLead(text))
+  if (!spokenText) return ""
+
+  return pickVariant(`${seed}:bridge-line`, [
+    `What makes this more interesting is the next part. ${spokenText}`,
+    `A more complete read sounds like this. ${spokenText}`,
+    `The fuller picture comes into focus here. ${spokenText}`,
+    `That story becomes clearer with one more detail. ${spokenText}`,
+  ])
+}
+
 function buildArticleNarration(
   article: Article,
   content: ArticleContent | null,
@@ -304,41 +332,56 @@ function buildArticleNarration(
   total: number,
   weatherContext: WeatherContext,
   includeIntro: boolean,
+  includeTransition: boolean,
   currentVoiceName?: string,
   nextVoiceName?: string,
 ) {
   const seed = `${article.title}|${article.source || ""}|${article.category || ""}`
   const tone = getListenTone(article.category)
-  const lead = normalizeSpeechText(content?.subtitle || article.summary || article.title, 170)
+  const bodyParagraphs = (content?.paragraphs || [])
+    .map((paragraph) => normalizeSpeechText(paragraph, 220))
+    .filter((paragraph) => paragraph.length > 45)
+
+  const lead = normalizeSpeechText(content?.subtitle || bodyParagraphs[0] || article.summary || article.title, 190)
   const paragraphs = (content?.paragraphs || [])
-    .map((paragraph) => normalizeSpeechText(paragraph, 190))
+    .map((paragraph) => normalizeSpeechText(paragraph, 220))
     .filter(Boolean)
 
-  const detail = paragraphs.find((paragraph) => paragraph.length > 90) || normalizeSpeechText(article.keyPoints?.[0] || "", 150)
-  const supporting = paragraphs.find((paragraph) => paragraph !== detail && paragraph.length > 70) || normalizeSpeechText(article.keyPoints?.[1] || "", 140)
+  const detail = bodyParagraphs.find((paragraph) => paragraph !== lead && paragraph.length > 85)
+    || paragraphs.find((paragraph) => paragraph.length > 90)
+    || normalizeSpeechText(article.keyPoints?.[0] || "", 170)
+  const supporting = bodyParagraphs.find((paragraph) => paragraph !== lead && paragraph !== detail && paragraph.length > 75)
+    || paragraphs.find((paragraph) => paragraph !== detail && paragraph.length > 70)
+    || normalizeSpeechText(article.keyPoints?.[1] || "", 160)
+  const contextDetail = bodyParagraphs.find((paragraph) => paragraph !== lead && paragraph !== detail && paragraph !== supporting && paragraph.length > 65)
+    || normalizeSpeechText(article.summary || "", 170)
   const opening = pickVariant(`${seed}:opening`, tone.opening)
   const detailLead = pickVariant(`${seed}:detail`, tone.detail)
   const closing = pickVariant(`${seed}:closing`, [
-    article.source ? `${article.source} is treating this as the important thread to watch.` : "That is the thread worth watching next.",
-    article.source ? `That is the angle ${article.source} keeps bringing forward.` : "That is the angle to keep in mind going forward.",
-    article.source ? `That is why ${article.source} is paying attention to this update.` : "That is why this update matters more than it first appears.",
+    "That is the thread worth watching next.",
+    "That is the angle to keep in mind going forward.",
+    "That is why this update matters more than it first appears.",
+    "That is the part that gives the story its weight.",
     ...tone.closing,
   ])
   const openingLine = buildOpeningLine(seed, opening, lead, article.title)
+  const contextLine = contextDetail ? buildContextLine(seed, detailLead, contextDetail) : ""
+  const bridgeLine = supporting ? buildBridgeLine(seed, supporting) : ""
 
   const lines = [
     includeIntro ? buildIntroLine(weatherContext) : "",
     openingLine,
     detail ? `${detailLead} ${toSentence(lowercaseLead(detail))}` : "",
-    supporting ? toSentence(supporting) : "",
+    bridgeLine,
+    contextLine,
     closing,
-    buildTransitionLine(seed, index === total - 1, currentVoiceName, nextVoiceName),
+    includeTransition ? buildTransitionLine(seed, index === total - 1, currentVoiceName, nextVoiceName) : "",
   ].filter(Boolean)
 
   return clipText(lines.join(" "), tone.max)
 }
 
-export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 0, onClose }: Props) {
+export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single', autoPlayToken = 0, onClose }: Props) {
   const [idx, setIdx] = useState(startIdx)
   const [playing, setPlaying] = useState(false)
   const [progress, setProgress] = useState(0)
@@ -349,17 +392,106 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
   const [weatherContext, setWeatherContext] = useState<WeatherContext>(() => buildWeatherContext())
   const [weatherResolved, setWeatherResolved] = useState(false)
   const [weatherSource, setWeatherSource] = useState<'gps' | 'ip' | 'none'>('none')
+  const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
   const [contentByLink, setContentByLink] = useState<Record<string, ArticleContent>>({})
   const [loadingByLink, setLoadingByLink] = useState<Record<string, boolean>>({})
   const [failedByLink, setFailedByLink] = useState<Record<string, boolean>>({})
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const audioStartTimerRef = useRef<number | null>(null)
+  const playbackRequestIdRef = useRef(0)
   const pendingAutoPlayIdxRef = useRef<number | null>(null)
+  const pendingContentRequestsRef = useRef<Record<string, Promise<ArticleContent | null>>>({})
+  const audioUrlCacheRef = useRef<Record<string, string>>({})
+  const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
   const sessionIdRef = useRef(createAudioSessionId("listen"))
 
   const current = articles[idx]
+  const isQueueMode = mode === 'queue'
+  const visibleCount = isQueueMode ? articles.length : (current ? 1 : 0)
+  const shouldPreferBrowserSpeech = String(import.meta.env.VITE_PREFER_BROWSER_TTS || '').toLowerCase() === 'true'
   const currentContent = current?.link ? contentByLink[current.link] || null : null
+
+  function buildVoiceForIndex(targetIndex: number) {
+    const article = articles[targetIndex]
+    if (!article) return null
+
+    return pickSequentialTtsVoice(
+      `${articles[startIdx]?.title || article.title}|${articles[startIdx]?.source || ""}|${startIdx}`,
+      targetIndex - startIdx,
+      "listen",
+    )
+  }
+
+  function shouldAllowGreeting(targetIndex: number) {
+    return isQueueMode && targetIndex === startIdx
+  }
+
+  function buildTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false) {
+    return apiUrl(
+      "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
+    )
+  }
+
+  function buildAudioCacheKey(text: string, voiceId?: string, allowGreeting = false) {
+    return `${voiceId || 'default'}::${allowGreeting ? 'greet' : 'plain'}::${text.slice(0, 2000)}`
+  }
+
+  async function ensureArticleContent(article?: Article | null) {
+    if (!article?.link) return null
+    if (contentByLink[article.link]) return contentByLink[article.link]
+    if (pendingContentRequestsRef.current[article.link]) return pendingContentRequestsRef.current[article.link]
+
+    setLoadingByLink((state) => ({ ...state, [article.link!]: true }))
+
+    const request = fetch(apiUrl(`/api/article-content?link=${encodeURIComponent(article.link)}`))
+      .then((response) => response.json())
+      .then((content: ArticleContent) => {
+        setContentByLink((state) => ({ ...state, [article.link!]: content }))
+        return content
+      })
+      .catch(() => {
+        setFailedByLink((state) => ({ ...state, [article.link!]: true }))
+        return null
+      })
+      .finally(() => {
+        delete pendingContentRequestsRef.current[article.link!]
+        setLoadingByLink((state) => ({ ...state, [article.link!]: false }))
+      })
+
+    pendingContentRequestsRef.current[article.link] = request
+    return request
+  }
+
+  async function preloadAudio(text: string, voiceId?: string, allowGreeting = false) {
+    if (shouldPreferBrowserSpeech || !text.trim()) return null
+
+    const cacheKey = buildAudioCacheKey(text, voiceId, allowGreeting)
+    if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
+    if (pendingAudioUrlRef.current[cacheKey]) return pendingAudioUrlRef.current[cacheKey]
+
+    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(text, voiceId, allowGreeting))
+      .then(async (response) => {
+        if (!response.ok) return null
+        const audioBlob = await response.blob()
+        const objectUrl = URL.createObjectURL(audioBlob)
+        audioUrlCacheRef.current[cacheKey] = objectUrl
+        return objectUrl
+      })
+      .catch(() => null)
+      .finally(() => {
+        delete pendingAudioUrlRef.current[cacheKey]
+      })
+
+    return pendingAudioUrlRef.current[cacheKey]
+  }
   useEffect(() => {
     let cancelled = false
+    const weatherTimeoutId = window.setTimeout(() => {
+      if (cancelled) return
+      setWeatherContext((current) => current.weatherLine ? current : buildWeatherContext())
+      setWeatherSource('none')
+      setWeatherResolved(true)
+    }, WEATHER_RESOLVE_TIMEOUT_MS)
 
     async function applyIpFallback() {
       try {
@@ -417,6 +549,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
 
     return () => {
       cancelled = true
+      window.clearTimeout(weatherTimeoutId)
     }
   }, [])
 
@@ -445,31 +578,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
   }, [startIdx, autoPlayToken])
 
   useEffect(() => {
-    if (!current?.link) return
-    if (contentByLink[current.link] || loadingByLink[current.link] || failedByLink[current.link]) return
-
-    let cancelled = false
-    setLoadingByLink((state) => ({ ...state, [current.link!]: true }))
-
-    fetch(`/api/article-content?link=${encodeURIComponent(current.link)}`)
-      .then((response) => response.json())
-      .then((content: ArticleContent) => {
-        if (cancelled) return
-        setContentByLink((state) => ({ ...state, [current.link!]: content }))
-      })
-      .catch(() => {
-        if (cancelled) return
-        setFailedByLink((state) => ({ ...state, [current.link!]: true }))
-      })
-      .finally(() => {
-        if (cancelled) return
-        setLoadingByLink((state) => ({ ...state, [current.link!]: false }))
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [current?.link, contentByLink, loadingByLink, failedByLink])
+    void ensureArticleContent(current)
+  }, [current?.link])
 
   const currentVoice = useMemo(() => {
     if (!current) return null
@@ -480,40 +590,101 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
     )
   }, [articles, current, idx, startIdx])
   const nextVoice = useMemo(() => {
-    if (!current || idx >= articles.length - 1) return null
+    if (!isQueueMode || !current || idx >= articles.length - 1) return null
     return pickSequentialTtsVoice(
       `${articles[startIdx]?.title || current.title}|${articles[startIdx]?.source || ""}|${startIdx}`,
       idx + 1 - startIdx,
       "listen",
     )
-  }, [articles, current, idx, startIdx])
+  }, [articles, current, idx, isQueueMode, startIdx])
   const script = current
     ? buildArticleNarration(
         current,
         currentContent,
         idx,
-        articles.length,
+        isQueueMode ? articles.length : 1,
         weatherContext,
-        idx === startIdx,
+        isQueueMode && idx === startIdx,
+        isQueueMode,
         currentVoice?.label,
         nextVoice?.label,
       )
     : ""
 
   useEffect(() => {
+    return () => {
+      Object.values(audioUrlCacheRef.current).forEach((url) => {
+        URL.revokeObjectURL(url)
+      })
+      audioUrlCacheRef.current = {}
+    }
+  }, [])
+
+  useEffect(() => {
+    if (shouldPreferBrowserSpeech) return
+    if (!current || !script.trim()) return
+    if (isQueueMode && idx === startIdx && !weatherResolved) return
+
+    void preloadAudio(script, currentVoice?.id, shouldAllowGreeting(idx))
+  }, [current?.link, currentVoice?.id, idx, isQueueMode, script, shouldPreferBrowserSpeech, startIdx, weatherResolved])
+
+  useEffect(() => {
+    if (!isQueueMode || shouldPreferBrowserSpeech) return
+
+    const nextIndex = idx + 1
+    const nextArticle = articles[nextIndex]
+    if (!nextArticle) return
+
+    let cancelled = false
+
+    void ensureArticleContent(nextArticle).then((nextContent) => {
+      if (cancelled) return
+
+      const nextCurrentVoice = buildVoiceForIndex(nextIndex)
+      const nextFollowingVoice = buildVoiceForIndex(nextIndex + 1)
+      const nextScript = buildArticleNarration(
+        nextArticle,
+        nextContent,
+        nextIndex,
+        articles.length,
+        weatherContext,
+        false,
+        true,
+        nextCurrentVoice?.label,
+        nextFollowingVoice?.label,
+      )
+
+      void preloadAudio(nextScript, nextCurrentVoice?.id, shouldAllowGreeting(nextIndex))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [articles, idx, isQueueMode, shouldPreferBrowserSpeech, startIdx, weatherContext])
+
+  useEffect(() => {
     if (!playing) return
     if (pendingAutoPlayIdxRef.current !== null && pendingAutoPlayIdxRef.current !== idx) return
-    if (idx === startIdx && !weatherResolved) return
+    if (isQueueMode && idx === startIdx && !weatherResolved) return
     pendingAutoPlayIdxRef.current = null
     doPlay()
-  }, [idx, playing, autoPlayToken, startIdx, weatherResolved])
+  }, [idx, playing, autoPlayToken, startIdx, weatherResolved, isQueueMode])
 
   useEffect(() => subscribeExclusiveAudio(sessionIdRef.current, () => {
+    playbackRequestIdRef.current += 1
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
     }
+    if (audioStartTimerRef.current !== null) {
+      window.clearTimeout(audioStartTimerRef.current)
+      audioStartTimerRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
     setPlaying(false)
+    setUsingSpeechFallback(false)
   }), [])
 
   if (!current) return null
@@ -523,10 +694,73 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
       audioRef.current.pause()
       audioRef.current = null
     }
+    if (audioStartTimerRef.current !== null) {
+      window.clearTimeout(audioStartTimerRef.current)
+      audioStartTimerRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
     setPlaying(false)
+    setUsingSpeechFallback(false)
+  }
+
+  function advanceToNextStory() {
+    setProgress(100)
+    if (isQueueMode && idx < articles.length - 1) {
+      pendingAutoPlayIdxRef.current = idx + 1
+      setIdx((value) => value + 1)
+    } else {
+      setPlaying(false)
+      setUsingSpeechFallback(false)
+    }
+  }
+
+  function playWithSpeechFallback() {
+    if (!('speechSynthesis' in window) || !script.trim()) {
+      setPlaying(false)
+      setUsingSpeechFallback(false)
+      return
+    }
+
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
+    if (audioStartTimerRef.current !== null) {
+      window.clearTimeout(audioStartTimerRef.current)
+      audioStartTimerRef.current = null
+    }
+
+    window.speechSynthesis.cancel()
+
+    const utterance = new SpeechSynthesisUtterance(script)
+    const availableVoices = window.speechSynthesis.getVoices()
+    const englishVoice = availableVoices.find((voice) => /en-/i.test(voice.lang)) || availableVoices[0]
+    if (englishVoice) utterance.voice = englishVoice
+    utterance.rate = 1
+    utterance.pitch = 1
+    utterance.onend = () => {
+      advanceToNextStory()
+    }
+    utterance.onerror = () => {
+      setPlaying(false)
+      setUsingSpeechFallback(false)
+    }
+
+    setUsingSpeechFallback(true)
+    setPlaying(true)
+    setProgress(12)
+    window.speechSynthesis.speak(utterance)
   }
 
   function doPlay() {
+    if (shouldPreferBrowserSpeech) {
+      requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
+      playWithSpeechFallback()
+      return
+    }
+
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
@@ -534,23 +768,65 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
 
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
     setPlaying(true)
+    setUsingSpeechFallback(false)
     setProgress(0)
-    const url = apiUrl("/api/tts?text=" + encodeURIComponent(script.slice(0, 2000)) + (currentVoice ? "&voice=" + encodeURIComponent(currentVoice.id) : ""))
-    const audio = new Audio(url)
-    audioRef.current = audio
-    audio.onended = () => {
-      setProgress(100)
-      if (idx < articles.length - 1) {
-        pendingAutoPlayIdxRef.current = idx + 1
-        setIdx((value) => value + 1)
-      } else {
-        setPlaying(false)
+    const playbackRequestId = playbackRequestIdRef.current + 1
+    playbackRequestIdRef.current = playbackRequestId
+    const fallbackToSpeech = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      playWithSpeechFallback()
+    }
+    const allowGreeting = shouldAllowGreeting(idx)
+    const requestUrl = buildTtsRequestUrl(script, currentVoice?.id, allowGreeting)
+    const cacheKey = buildAudioCacheKey(script, currentVoice?.id, allowGreeting)
+
+    const startAudio = (sourceUrl: string) => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+
+      const audio = new Audio(sourceUrl)
+      audioRef.current = audio
+      audio.oncanplay = () => {
+        if (audioStartTimerRef.current !== null) {
+          window.clearTimeout(audioStartTimerRef.current)
+          audioStartTimerRef.current = null
+        }
       }
+      audio.onended = () => {
+        advanceToNextStory()
+      }
+      audio.ontimeupdate = () => {
+        if (audio.duration) setProgress((audio.currentTime / audio.duration) * 100)
+      }
+      audio.onerror = () => {
+        fallbackToSpeech()
+      }
+      audioStartTimerRef.current = window.setTimeout(() => {
+        fallbackToSpeech()
+      }, AUDIO_START_TIMEOUT_MS)
+      audio.play().catch(() => fallbackToSpeech())
     }
-    audio.ontimeupdate = () => {
-      if (audio.duration) setProgress((audio.currentTime / audio.duration) * 100)
+
+    const cachedAudioUrl = audioUrlCacheRef.current[cacheKey]
+    if (cachedAudioUrl) {
+      startAudio(cachedAudioUrl)
+      return
     }
-    audio.play().catch(() => setPlaying(false))
+
+    audioStartTimerRef.current = window.setTimeout(() => {
+      fallbackToSpeech()
+    }, AUDIO_START_TIMEOUT_MS)
+
+    void (pendingAudioUrlRef.current[cacheKey] || preloadAudio(script, currentVoice?.id, allowGreeting))
+      .then((preloadedUrl) => {
+        if (audioStartTimerRef.current !== null) {
+          window.clearTimeout(audioStartTimerRef.current)
+          audioStartTimerRef.current = null
+        }
+        startAudio(preloadedUrl || requestUrl)
+      })
+      .catch(() => {
+        fallbackToSpeech()
+      })
   }
 
   function togglePlay() {
@@ -564,12 +840,14 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
   }
 
   function next() {
+    if (!isQueueMode) return
     doStop()
     setProgress(0)
     if (idx < articles.length - 1) setIdx((value) => value + 1)
   }
 
   function prev() {
+    if (!isQueueMode) return
     doStop()
     setProgress(0)
     if (idx > 0) setIdx((value) => value - 1)
@@ -660,14 +938,14 @@ export default function PodcastPlayer({ articles, startIdx = 0, autoPlayToken = 
         </div>
       </div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current.title}</div>
-      <div style={{ fontSize: 11, color: panelMuted, marginBottom: 10 }}>{idx + 1} / {articles.length}</div>
+      <div style={{ fontSize: 11, color: panelMuted, marginBottom: 10 }}>{isQueueMode ? `${idx + 1} / ${articles.length}` : `1 / ${visibleCount || 1}`}</div>
       <div style={{ height: 4, background: panelSoft, borderRadius: 999, marginBottom: 12, overflow: "hidden" }}>
         <div style={{ height: "100%", width: progress + "%", background: accent, borderRadius: 999, transition: "width 0.3s" }} />
       </div>
       <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center" }}>
-        <button onClick={prev} style={cb}><SkipBack size={16} /></button>
+        <button onClick={prev} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipBack size={16} /></button>
         <button onClick={togglePlay} style={{ ...cb, width: 44, height: 44, fontSize: 14, background: accent, color: "#fff", border: "none", boxShadow: "0 8px 20px rgba(184,71,42,0.28)" }}>{playing ? <Pause size={18} /> : <Play size={18} />}</button>
-        <button onClick={next} style={cb}><SkipForward size={16} /></button>
+        <button onClick={next} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipForward size={16} /></button>
       </div>
     </div>
   )

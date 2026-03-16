@@ -12,7 +12,7 @@ services:
       - key: HOST
         value: 0.0.0.0
       - key: CORS_ORIGIN
-        value: https://leightsong.github.io
+        value: https://tsong-li.github.io
       - key: SILICONFLOW_API_KEY
         sync: false
       - key: SILICONFLOW_MODEL

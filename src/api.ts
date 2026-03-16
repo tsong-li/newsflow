@@ -9,3 +9,12 @@ export function apiUrl(path: string) {
 }
 
 export const apiBaseUrl = rawApiBaseUrl
+
+export function proxiedImageUrl(sourceUrl: string) {
+  const value = String(sourceUrl || '').trim()
+  if (!value) return ''
+  if (!/^https?:/i.test(value)) return value
+
+  const params = new URLSearchParams({ url: value })
+  return apiUrl(`/api/image?${params.toString()}`)
+}

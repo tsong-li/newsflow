@@ -1,6 +1,6 @@
 import PodcastPlayer from './PodcastPlayer'
 import WatchPlayer from './WatchPlayer'
-import { apiUrl } from './api'
+import { apiUrl, proxiedImageUrl } from './api'
 import React, { startTransition, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, ArrowUpRight, Headphones, Play, Brain, Sparkles, Loader2, X } from 'lucide-react'
 
@@ -45,6 +45,10 @@ interface ArticleMedia {
 }
 
 const WATCH_IMAGE_TARGET = 4
+const DIGEST_PRELOAD_COUNT = 4
+const DIGEST_PRELOAD_STAGGER_MS = 220
+const WATCH_PRELOAD_COUNT = 4
+const WATCH_PRELOAD_STAGGER_MS = 320
 
 const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'World', 'Science']
 const API = apiUrl('/api')
@@ -52,15 +56,44 @@ function getRequiredWatchMediaCount(item: NewsItem) {
   return Math.max(0, WATCH_IMAGE_TARGET - (item.image ? 1 : 0))
 }
 
-function getImage(item: any): string {
-  if (item.image) return item.image
-  const s = Math.abs([...item.title].reduce((a: number, c: string) => a + c.charCodeAt(0), 0))
-  return `https://picsum.photos/seed/${s}/800/600`
+function hasSourceImage(item: NewsItem | null | undefined): item is NewsItem {
+  return Boolean(item?.image)
+}
+
+function getSourceImage(item: NewsItem) {
+  return item.image || ''
+}
+
+function getRenderableSourceImage(item: NewsItem) {
+  return proxiedImageUrl(item.image || '') || item.image || ''
 }
 
 function getImageQuality(item: NewsItem): 'high' | 'medium' | 'low' | 'fallback' {
   if (!item.image) return 'fallback'
   return item.imageQuality || 'medium'
+}
+
+function NewsImage({ src, fallbackSrc, eager = false }: { src: string; fallbackSrc?: string; eager?: boolean }) {
+  const [resolvedSrc, setResolvedSrc] = useState(src)
+
+  useEffect(() => {
+    setResolvedSrc(src)
+  }, [src])
+
+  return (
+    <img
+      className="news-image"
+      src={resolvedSrc}
+      alt=""
+      loading={eager ? 'eager' : 'lazy'}
+      decoding="async"
+      fetchPriority={eager ? 'high' : 'auto'}
+      onError={() => {
+        if (!fallbackSrc || resolvedSrc === fallbackSrc) return
+        setResolvedSrc(fallbackSrc)
+      }}
+    />
+  )
 }
 
 const TODAY = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
@@ -81,6 +114,7 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [showPodcast, setShowPodcast] = useState(false)
   const [podcastIdx, setPodcastIdx] = useState(0)
+  const [podcastMode, setPodcastMode] = useState<'queue' | 'single'>('queue')
   const [podcastAutoPlayToken, setPodcastAutoPlayToken] = useState(0)
   const [watch, setWatch] = useState<ReaderState | null>(null)
   const [watchAnalysis, setWatchAnalysis] = useState<AnalysisState | null>(null)
@@ -100,6 +134,8 @@ function App() {
   const prefetchedRef = useRef(false)
   const analysisCacheRef = useRef<Record<string, AnalysisState>>({})
   const pendingAnalysisRef = useRef<Record<string, Promise<AnalysisState>>>({})
+  const analysisPrefetchRef = useRef<Record<string, boolean>>({})
+  const watchPrefetchRef = useRef<Record<string, boolean>>({})
   const contentCacheRef = useRef<Record<string, ArticleContent>>({})
   const pendingContentRef = useRef<Record<string, Promise<ArticleContent>>>({})
   const mediaCacheRef = useRef<Record<string, string[]>>({})
@@ -125,8 +161,9 @@ function App() {
     return request
   }
 
-  function openPodcast(startIdx: number) {
+  function openPodcast(startIdx: number, mode: 'queue' | 'single' = 'single') {
     setPodcastIdx(startIdx)
+    setPodcastMode(mode)
     setPodcastAutoPlayToken((value) => value + 1)
     setShowPodcast(true)
   }
@@ -281,7 +318,7 @@ function App() {
       .then((response) => response.json())
       .then((media: ArticleMedia[]) => {
         const nextMedia = (Array.isArray(media) ? media : [])
-          .map((entry) => entry?.url)
+          .map((entry) => proxiedImageUrl(entry?.url || ''))
           .filter((url): url is string => Boolean(url))
         mediaCacheRef.current[key] = nextMedia
         return nextMedia
@@ -292,6 +329,26 @@ function App() {
 
     pendingMediaRef.current[key] = request
     return request
+  }
+
+  async function preloadWatchAssets(item: NewsItem, idx: number) {
+    const key = item.link
+
+    if (watchPrefetchRef.current[key]) return
+    watchPrefetchRef.current[key] = true
+
+    const tasks = [
+      fetchAnalysis(item, idx),
+      fetchArticleContent(item),
+      fetchArticleMedia(item),
+      fetchArticleVideo(item),
+    ]
+
+    const results = await Promise.allSettled(tasks)
+    const allFailed = results.every((result) => result.status === 'rejected')
+    if (allFailed) {
+      delete watchPrefetchRef.current[key]
+    }
   }
 
   async function deepAnalyze(item: NewsItem, idx: number) {
@@ -347,6 +404,34 @@ function App() {
 
     return () => timers.forEach(window.clearTimeout)
   }, [tab, news.length])
+
+  useEffect(() => {
+    if (!news.length) return
+
+    const preloadItems = news.slice(0, DIGEST_PRELOAD_COUNT)
+    const timers = preloadItems.map((item, index) => window.setTimeout(() => {
+      const key = getAnalysisKey(item)
+
+      if (analysisPrefetchRef.current[key]) return
+      analysisPrefetchRef.current[key] = true
+      fetchAnalysis(item, index).catch(() => {
+        delete analysisPrefetchRef.current[key]
+      })
+    }, DIGEST_PRELOAD_STAGGER_MS * index))
+
+    return () => timers.forEach(window.clearTimeout)
+  }, [news])
+
+  useEffect(() => {
+    if (!news.length) return
+
+    const preloadItems = news.slice(0, WATCH_PRELOAD_COUNT)
+    const timers = preloadItems.map((item, index) => window.setTimeout(() => {
+      void preloadWatchAssets(item, index).catch(() => {})
+    }, WATCH_PRELOAD_STAGGER_MS * index))
+
+    return () => timers.forEach(window.clearTimeout)
+  }, [news])
 
   useEffect(() => {
     const handlePopState = () => {
@@ -557,9 +642,9 @@ function App() {
             </div>
           </div>
 
-          {getImage(readerItem) && (
+          {hasSourceImage(readerItem) && (
             <div className="reader-visual" data-quality={getImageQuality(readerItem)}>
-              <img className="news-image" src={getImage(readerItem)} alt="" />
+              <NewsImage src={getRenderableSourceImage(readerItem)} fallbackSrc={getSourceImage(readerItem)} eager />
             </div>
           )}
 
@@ -578,7 +663,7 @@ function App() {
                 <p>{readerItem.time}</p>
               </div>
               <div className="reader-actions">
-                <button className="reader-action" onClick={() => openPodcast(reader.idx)}><Headphones size={15} /> Listen</button>
+                <button className="reader-action" onClick={() => openPodcast(reader.idx, 'single')}><Headphones size={15} /> Listen</button>
                 <button className="reader-action" onClick={() => openWatch(readerItem, reader.idx)}><Play size={15} /> Watch</button>
                 <button className="reader-action" onClick={() => deepAnalyze(readerItem, reader.idx)}><Brain size={15} /> Digest</button>
                 <button className="reader-action" onClick={() => open(readerItem.link)}><ArrowUpRight size={15} /> Original</button>
@@ -672,7 +757,7 @@ function App() {
         <h1 className="masthead-title">NEWSFLOW</h1>
         <p className="masthead-date">{TODAY}</p>
         <button
-          onClick={() => openPodcast(0)}
+          onClick={() => openPodcast(0, 'queue')}
           style={{ position:"fixed", bottom: 20, right: 20, zIndex: 9998, background:"linear-gradient(135deg,#e74c3c,#c0392b)", color:"#fff", border:"none", borderRadius:"50%", width:56, height:56, cursor:"pointer", boxShadow:"0 4px 20px rgba(0,0,0,0.3)", display:"flex", alignItems:"center", justifyContent:"center" }}
           title="Listen"
           aria-label="Listen"
@@ -701,14 +786,14 @@ function App() {
           {hero && (
             <div className="wrapper">
               <section className="hero-section" onClick={() => openArticle(hero, 0)}>
-                {getImage(hero) && (
-                  <div className="hero-img" data-quality={getImageQuality(hero)}><img className="news-image" src={getImage(hero)} alt="" /></div>
+                {hasSourceImage(hero) && (
+                  <div className="hero-img" data-quality={getImageQuality(hero)}><NewsImage src={getRenderableSourceImage(hero)} fallbackSrc={getSourceImage(hero)} eager /></div>
                 )}
                 <div className="hero-text">
                   <p className="hero-cat">{hero.category}</p>
                   <h2 className="hero-title">{hero.title}</h2>
                   <p className="hero-summary">{hero.summary?.slice(0, 180)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(0)} onWatch={() => openWatch(news[0], 0)} onDeep={() => deepAnalyze(news[0], 0)} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(0, 'single')} onWatch={() => openWatch(news[0], 0)} onDeep={() => deepAnalyze(news[0], 0)} />
                 </div>
               </section>
             </div>
@@ -722,13 +807,13 @@ function App() {
               <div className="two-up">
                 {pair.map(item => (
                   <article key={item.id} className="two-up-item" onClick={() => openArticle(item, news.indexOf(item))}>
-                    {getImage(item) && (
-                      <div className="two-up-img" data-quality={getImageQuality(item)}><img className="news-image" src={getImage(item)} alt="" /></div>
+                    {hasSourceImage(item) && (
+                      <div className="two-up-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                     )}
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 120)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                   </article>
                 ))}
               </div>
@@ -748,14 +833,14 @@ function App() {
             <div className="wrapper story-list">
               {middle.map(item => (
                 <article key={item.id} className="story-row" onClick={() => openArticle(item, news.indexOf(item))}>
-                  {getImage(item) ? (
-                    <div className="story-row-img" data-quality={getImageQuality(item)}><img className="news-image" src={getImage(item)} alt="" /></div>
+                  {hasSourceImage(item) ? (
+                    <div className="story-row-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                   ) : <div />}
                   <div className="story-row-text">
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 140)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                   </div>
                 </article>
               ))}
@@ -771,7 +856,7 @@ function App() {
                   <p className="item-cat">{item.category}</p>
                   <h3 className="item-title" style={{ fontSize: 22 }}>{item.title}</h3>
                   <p className="item-excerpt">{item.summary?.slice(0, 100)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item))} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
                 </article>
               ))}
             </div>
@@ -847,8 +932,8 @@ function App() {
         </div>
       </div>
     )}
-    {watch && <WatchPlayer article={watch.item} analysis={watchAnalysis} content={watchContent} contentLoading={watchContentLoading} mediaImages={watchMedia} video={watchVideo} videoLoading={watchVideoLoading} image={getImage(watch.item)} onClose={closeWatch} />}
-    {showPodcast && <PodcastPlayer articles={news} startIdx={podcastIdx} autoPlayToken={podcastAutoPlayToken} onClose={() => setShowPodcast(false)} />}
+    {watch && <WatchPlayer article={watch.item} analysis={watchAnalysis} content={watchContent} contentLoading={watchContentLoading} mediaImages={watchMedia} video={watchVideo} videoLoading={watchVideoLoading} image={getRenderableSourceImage(watch.item)} onClose={closeWatch} />}
+    {showPodcast && <PodcastPlayer articles={news} startIdx={podcastIdx} mode={podcastMode} autoPlayToken={podcastAutoPlayToken} onClose={() => setShowPodcast(false)} />}
     </div>
   )
 }
