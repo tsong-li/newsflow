@@ -3,6 +3,7 @@ import { Pause, Play, X } from 'lucide-react'
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from './audioSession'
 import { apiUrl, proxiedImageUrl } from './api'
 import { pickTtsVoice } from './ttsVoices'
+import type { CSSProperties } from 'react'
 
 const AUDIO_START_TIMEOUT_MS = 4000
 
@@ -233,6 +234,44 @@ function buildCaptions(narration: string, durationMs: number): WatchCaption[] {
   })
 }
 
+function formatPlaybackTime(ms: number) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+function resolveTimelinePosition(scenes: WatchScene[], progressPercent: number) {
+  const clampedProgress = Math.max(0, Math.min(100, progressPercent))
+  const totalDurationMs = scenes.reduce((total, scene) => total + scene.durationMs, 0)
+  const targetElapsedMs = Math.round((clampedProgress / 100) * totalDurationMs)
+  let accumulatedMs = 0
+  let targetSceneIndex = 0
+  let targetSceneElapsedMs = 0
+
+  for (let index = 0; index < scenes.length; index += 1) {
+    const scene = scenes[index]
+    const sceneEndMs = accumulatedMs + scene.durationMs
+    if (targetElapsedMs <= sceneEndMs || index === scenes.length - 1) {
+      targetSceneIndex = index
+      targetSceneElapsedMs = Math.max(0, Math.min(scene.durationMs, targetElapsedMs - accumulatedMs))
+      break
+    }
+    accumulatedMs = sceneEndMs
+  }
+
+  const scene = scenes[targetSceneIndex]
+  const sceneProgress = scene?.durationMs ? Math.min(100, (targetSceneElapsedMs / scene.durationMs) * 100) : 0
+
+  return {
+    totalDurationMs,
+    targetElapsedMs,
+    targetSceneIndex,
+    targetSceneElapsedMs,
+    targetSceneProgress: sceneProgress,
+  }
+}
+
 function isUnavailableAnalysisText(text?: string) {
   const value = String(text || '').trim().toLowerCase()
   if (!value) return false
@@ -372,6 +411,8 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const [playing, setPlaying] = useState(false)
   const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
   const [audioPreparing, setAudioPreparing] = useState(false)
+  const [isScrubbing, setIsScrubbing] = useState(false)
+  const [sliderProgress, setSliderProgress] = useState(0)
   const [sceneDurationOverrides, setSceneDurationOverrides] = useState<Record<string, number>>({})
   const [sceneIndex, setSceneIndex] = useState(0)
   const [elapsedMs, setElapsedMs] = useState(0)
@@ -391,6 +432,9 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const imageTransitionTimerRef = useRef<number | null>(null)
   const liveImageTransformRef = useRef('translate3d(0px, 0, 0) scale(1.03)')
   const autoplayStartedRef = useRef(false)
+  const sliderProgressRef = useRef(0)
+  const isScrubbingRef = useRef(false)
+  const shouldResumeAfterScrubRef = useRef(false)
   const sessionIdRef = useRef(createAudioSessionId('watch'))
 
   const baseScenes = useMemo(() => buildScenes(article, analysis, content), [article, analysis, content])
@@ -753,6 +797,52 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     jumpToScene(nextIndex)
   }
 
+  function seekToProgress(nextProgress: number, shouldResumePlayback = playing || audioPreparing) {
+    if (hasOriginalVideo || !scenes.length || totalMs <= 0) return
+
+    const timelinePosition = resolveTimelinePosition(scenes, nextProgress)
+    const targetSceneIndex = timelinePosition.targetSceneIndex
+    const targetSceneElapsedMs = timelinePosition.targetSceneElapsedMs
+
+    sceneResumeMsRef.current = targetSceneElapsedMs
+    syncSceneProgress(targetSceneIndex, targetSceneElapsedMs)
+
+    if (shouldResumePlayback) {
+      playScene(targetSceneIndex, targetSceneElapsedMs)
+    }
+  }
+
+  function beginScrub(currentProgress = progress) {
+    if (isScrubbingRef.current) return
+    shouldResumeAfterScrubRef.current = playing || audioPreparing
+    if (shouldResumeAfterScrubRef.current) {
+      pausePlayback()
+    }
+    const clampedProgress = Math.max(0, Math.min(100, currentProgress))
+    isScrubbingRef.current = true
+    setIsScrubbing(true)
+    setSliderProgress(clampedProgress)
+    sliderProgressRef.current = clampedProgress
+  }
+
+  function updateScrub(nextProgress: number) {
+    const clampedProgress = Math.max(0, Math.min(100, nextProgress))
+    setSliderProgress(clampedProgress)
+    sliderProgressRef.current = clampedProgress
+  }
+
+  function commitScrub(finalProgress = sliderProgressRef.current) {
+    if (!isScrubbingRef.current) return
+    const shouldResumePlayback = shouldResumeAfterScrubRef.current
+    const clampedProgress = Math.max(0, Math.min(100, finalProgress))
+    isScrubbingRef.current = false
+    shouldResumeAfterScrubRef.current = false
+    setIsScrubbing(false)
+    setSliderProgress(clampedProgress)
+    sliderProgressRef.current = clampedProgress
+    seekToProgress(clampedProgress, shouldResumePlayback)
+  }
+
   useEffect(() => {
     if (hasOriginalVideo || videoLoading) {
       stopNarration()
@@ -799,7 +889,17 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   }), [])
 
   const progress = totalMs ? Math.min(100, (elapsedMs / totalMs) * 100) : 0
-  const sceneProgress = currentScene?.durationMs ? Math.min(100, (sceneElapsedMs / currentScene.durationMs) * 100) : 0
+  useEffect(() => {
+    if (isScrubbingRef.current) return
+    setSliderProgress(progress)
+    sliderProgressRef.current = progress
+  }, [progress])
+
+  const displayedProgress = sliderProgress
+  const scrubTimelinePosition = isScrubbing ? resolveTimelinePosition(scenes, displayedProgress) : null
+  const displayedSceneIndex = scrubTimelinePosition?.targetSceneIndex ?? sceneIndex
+  const displayedSceneProgress = scrubTimelinePosition?.targetSceneProgress ?? (currentScene?.durationMs ? Math.min(100, (sceneElapsedMs / currentScene.durationMs) * 100) : 0)
+  const displayedElapsedMs = Math.round((Math.max(0, Math.min(displayedProgress, 100)) / 100) * totalMs)
   const activeCaption = currentScene?.captions?.[activeCaptionIndex]
   const currentMotionProgress = currentScene?.durationMs ? (sceneElapsedMs / currentScene.durationMs) : 0
   const motionProfiles = [
@@ -970,7 +1070,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
                     </div>
                     <div style={{ display: 'grid', gap: 8, justifyItems: 'center' }}>
                       <div style={{ height: 3, borderRadius: 999, background: 'rgba(255,255,255,0.12)', overflow: 'hidden', maxWidth: 520 }}>
-                        <div style={{ height: '100%', width: `${sceneProgress}%`, borderRadius: 999, background: currentScene?.accent || 'rgba(184,71,42,0.92)', transition: 'width 160ms linear' }} />
+                        <div style={{ height: '100%', width: `${displayedSceneProgress}%`, borderRadius: 999, background: currentScene?.accent || 'rgba(184,71,42,0.92)', transition: 'width 160ms linear' }} />
                       </div>
                     </div>
                   </div>
@@ -982,8 +1082,32 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
 
         <div style={{ position: 'relative', padding: '18px 4px 4px' }}>
           {!hasOriginalVideo && (
-            <div style={{ height: 4, borderRadius: 999, background: 'rgba(26,26,26,0.08)', overflow: 'hidden', marginBottom: 18 }}>
-              <div style={{ height: '100%', width: `${progress}%`, borderRadius: 999, background: 'linear-gradient(90deg, #e74c3c, #d04a31, #b8472a)', transition: 'width 160ms linear' }} />
+            <div style={{ display: 'grid', gap: 8, marginBottom: 18 }}>
+              <input
+                className="podcast-progress-slider"
+                type="range"
+                min={0}
+                max={100}
+                step={0.1}
+                value={displayedProgress}
+                onPointerDown={(event) => beginScrub(Number((event.currentTarget as HTMLInputElement).value))}
+                onPointerUp={(event) => commitScrub(Number((event.currentTarget as HTMLInputElement).value))}
+                onPointerCancel={() => commitScrub()}
+                onInput={(event) => updateScrub(Number((event.currentTarget as HTMLInputElement).value))}
+                onKeyDown={(event) => {
+                  if (!isScrubbingRef.current) {
+                    beginScrub(Number((event.currentTarget as HTMLInputElement).value))
+                  }
+                }}
+                onKeyUp={(event) => commitScrub(Number((event.currentTarget as HTMLInputElement).value))}
+                onBlur={() => commitScrub()}
+                aria-label="Seek watch playback"
+                style={{ ['--progress' as string]: `${displayedProgress}%`, ['--accent-start' as string]: '#e74c3c', ['--accent-end' as string]: '#c0392b', ['--track' as string]: 'rgba(26,26,26,0.08)' } as CSSProperties}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 10, color: shellMuted, letterSpacing: 0.2, padding: '0 2px' }}>
+                <span>{formatPlaybackTime(displayedElapsedMs)}</span>
+                <span>{formatPlaybackTime(totalMs)}</span>
+              </div>
             </div>
           )}
 
@@ -999,12 +1123,12 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
                   <button
                     key={scene.id}
                     onClick={() => jumpToScene(index)}
-                    style={{ padding: '9px 12px', borderRadius: 14, border: index === sceneIndex ? '1px solid rgba(231,76,60,0.18)' : chipBorder, background: index === sceneIndex ? 'rgba(231,76,60,0.08)' : shellSoft, color: index === sceneIndex ? '#6c2d1e' : '#5d534d', cursor: 'pointer', fontSize: 11, letterSpacing: 0.3, minWidth: 114, textAlign: 'left' }}
+                    style={{ padding: '9px 12px', borderRadius: 14, border: index === displayedSceneIndex ? '1px solid rgba(231,76,60,0.18)' : chipBorder, background: index === displayedSceneIndex ? 'rgba(231,76,60,0.08)' : shellSoft, color: index === displayedSceneIndex ? '#6c2d1e' : '#5d534d', cursor: 'pointer', fontSize: 11, letterSpacing: 0.3, minWidth: 114, textAlign: 'left' }}
                   >
                     <div style={{ display: 'grid', gap: 6 }}>
                       <span>{index + 1}. {scene.label}</span>
                       <span style={{ height: 2, borderRadius: 999, background: 'rgba(26,26,26,0.08)', overflow: 'hidden' }}>
-                        <span style={{ display: 'block', height: '100%', width: `${index === sceneIndex ? sceneProgress : index < sceneIndex ? 100 : 0}%`, background: index === sceneIndex ? '#e74c3c' : 'rgba(93,83,77,0.38)', transition: 'width 160ms linear' }} />
+                        <span style={{ display: 'block', height: '100%', width: `${index === displayedSceneIndex ? displayedSceneProgress : index < displayedSceneIndex ? 100 : 0}%`, background: index === displayedSceneIndex ? '#e74c3c' : 'rgba(93,83,77,0.38)', transition: 'width 160ms linear' }} />
                       </span>
                     </div>
                   </button>

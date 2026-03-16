@@ -985,6 +985,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const panelMuted = "rgba(26,26,26,0.5)"
   const panelSoft = "rgba(26,26,26,0.08)"
   const accent = "#b8472a"
+  const primaryButtonStart = "#e74c3c"
+  const primaryButtonEnd = "#c0392b"
   const primaryButtonBackground = "linear-gradient(135deg,#e74c3c,#c0392b)"
   const primaryButtonShadow = "0 8px 20px rgba(192,57,43,0.28)"
   const collapsedStyle: CSSProperties = isMobileViewport
@@ -1118,7 +1120,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
           value={progress}
           onChange={(event) => seekToProgress(Number(event.target.value))}
           aria-label="Seek playback"
-          style={{ ["--progress" as string]: `${progress}%`, ["--accent" as string]: accent, ["--track" as string]: panelSoft } as CSSProperties}
+          style={{ ["--progress" as string]: `${progress}%`, ["--accent-start" as string]: primaryButtonStart, ["--accent-end" as string]: primaryButtonEnd, ["--track" as string]: panelSoft } as CSSProperties}
         />
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 10, color: panelMuted, letterSpacing: 0.2 }}>
           <span>{formatPlaybackTime(displayedElapsedMs)}</span>

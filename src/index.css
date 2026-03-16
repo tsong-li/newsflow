@@ -225,7 +225,7 @@ img { display: block; width: 100%; }
 .podcast-progress-slider::-webkit-slider-runnable-track {
   height: 3px;
   border-radius: 999px;
-  background: linear-gradient(90deg, var(--accent) 0%, var(--accent) var(--progress), var(--track) var(--progress), var(--track) 100%);
+  background: linear-gradient(90deg, var(--accent-start) 0%, var(--accent-end) var(--progress), var(--track) var(--progress), var(--track) 100%);
 }
 
 .podcast-progress-slider::-webkit-slider-thumb {
@@ -236,7 +236,7 @@ img { display: block; width: 100%; }
   margin-top: -4.5px;
   border: 2px solid rgba(255,255,255,0.92);
   border-radius: 50%;
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
   box-shadow: 0 4px 12px rgba(184,71,42,0.28);
 }
 
@@ -250,7 +250,7 @@ img { display: block; width: 100%; }
 .podcast-progress-slider::-moz-range-progress {
   height: 3px;
   border-radius: 999px;
-  background: var(--accent);
+  background: linear-gradient(90deg, var(--accent-start), var(--accent-end));
 }
 
 .podcast-progress-slider::-moz-range-thumb {
@@ -258,7 +258,7 @@ img { display: block; width: 100%; }
   height: 12px;
   border: 2px solid rgba(255,255,255,0.92);
   border-radius: 50%;
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
   box-shadow: 0 4px 12px rgba(184,71,42,0.28);
 }
 

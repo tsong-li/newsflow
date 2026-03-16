@@ -97,10 +97,15 @@ const CATEGORY_FETCH_BUDGETS = {
   All: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 4 },
   Tech: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 4 },
   Business: { feedItemLimit: 10, articleImageLimit: 4, imageFetchConcurrency: 3 },
+  Finance: { feedItemLimit: 10, articleImageLimit: 6, imageFetchConcurrency: 3 },
   Sports: { feedItemLimit: 8, articleImageLimit: 3, imageFetchConcurrency: 4 },
   World: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 3 },
   Science: { feedItemLimit: 8, articleImageLimit: 4, imageFetchConcurrency: 3 },
 }
+const ALL_CATEGORY_ORDER = ['Tech', 'Business', 'Sports', 'World', 'Science']
+const ALL_MIN_ITEMS_PER_CATEGORY = 4
+const ALL_FINANCE_SOURCE_ORDER = ['Bloomberg Markets', 'WSJ Markets']
+const ALL_FINANCE_MIN_ITEMS = 2
 const STOCK_IMAGE_TARGET = 4
 const MAX_SUPPLEMENTAL_MEDIA_WHEN_ORIGINALS_PRESENT = 2
 const TITLE_STOP_WORDS = new Set([
@@ -1654,24 +1659,69 @@ function rankArticle(article, sourceStats, index) {
   return article.imageQualityScore * 1.6 + averageQualityScore * 0.35 + coverageScore + freshnessScore + varietyScore + jitter + (article.sourceRankBias || 0)
 }
 
+function isFinanceFeedStory(category, source) {
+  return category === 'Finance' || ['Bloomberg Markets', 'WSJ Markets'].includes(String(source || ''))
+}
+
+function mixAllCategoryArticles(articles, limit = 20) {
+  const targetLimit = Math.max(1, Number(limit) || 20)
+  const selected = []
+  const selectedIds = new Set()
+
+  for (const category of ALL_CATEGORY_ORDER) {
+    const categoryStories = articles
+      .filter((article) => article.category === category)
+      .slice(0, ALL_MIN_ITEMS_PER_CATEGORY)
+
+    for (const article of categoryStories) {
+      if (selectedIds.has(article.id)) continue
+      selected.push(article)
+      selectedIds.add(article.id)
+    }
+  }
+
+  const financeSelections = []
+  for (const source of ALL_FINANCE_SOURCE_ORDER) {
+    const nextFinance = articles.find((article) => article.source === source && !selectedIds.has(article.id))
+    if (!nextFinance) continue
+    financeSelections.push(nextFinance)
+    selectedIds.add(nextFinance.id)
+    if (financeSelections.length >= ALL_FINANCE_MIN_ITEMS) break
+  }
+
+  return selected
+    .concat(financeSelections)
+    .concat(articles.filter((article) => !selectedIds.has(article.id)))
+    .slice(0, targetLimit)
+}
+
 async function buildCategoryArticles(category, feeds) {
   const categoryBudget = CATEGORY_FETCH_BUDGETS[category] || CATEGORY_FETCH_BUDGETS.All
   const results = await Promise.allSettled(
     feeds.map(async f => {
       const feed = await parser.parseURL(f.url)
+      const sourceItems = Array.isArray(feed.items) ? feed.items : []
+      const filteredItems = typeof f.skipIf === 'function'
+        ? sourceItems.filter((item) => !f.skipIf(item))
+        : sourceItems
       const feedItemLimit = f.feedItemLimit || categoryBudget.feedItemLimit || 8
       const articleImageLimit = f.articleImageLimit ?? categoryBudget.articleImageLimit ?? feedItemLimit
       const imageFetchConcurrency = f.imageFetchConcurrency || categoryBudget.imageFetchConcurrency || 4
-      const feedItems = feed.items.slice(0, feedItemLimit)
+      const feedItems = filteredItems.slice(0, feedItemLimit)
 
       return mapWithConcurrency(feedItems, imageFetchConcurrency, async (item, index) => {
-        const image = await resolveArticleImage(item, {
+        const isFinanceStory = isFinanceFeedStory(category, f.name)
+        let image = await resolveArticleImage(item, {
           allowOgFetch: index < articleImageLimit
         })
+        if (!image && isFinanceStory) {
+          const fallbackImages = await getSupplementalStockImages(item.title || '', 'Finance', 1)
+          image = fallbackImages[0]?.url || ''
+        }
         const imageMeta = getImageQualityMeta(image)
         return {
           id: item.guid || item.link || Math.random().toString(36),
-          category: category === 'All' ? f.name : category,
+          category: category === 'All' ? (f.categoryLabel || f.name) : category,
           title: item.title || '',
           summary: (item.contentSnippet || item.content || '').replace(/<[^>]*>/g, '').slice(0, 300),
           keyPoints: [],
@@ -1699,7 +1749,14 @@ async function buildCategoryArticles(category, feeds) {
   articles = articles
     .map((article, index) => ({ ...article, rankScore: rankArticle(article, sourceStats, index) }))
     .sort((a, b) => b.rankScore - a.rankScore)
-    .slice(0, 20)
+
+  if (category === 'All') {
+    articles = mixAllCategoryArticles(articles, 22)
+  } else {
+    articles = articles.slice(0, 20)
+  }
+
+  articles = articles
     .map(({ rankScore, publishedAt, imageQualityScore, sourceRankBias, ...article }) => ({ ...article, imageQualityScore }))
 
   const ok = results.filter(r => r.status === 'fulfilled').length

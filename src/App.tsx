@@ -49,8 +49,12 @@ const DIGEST_PRELOAD_COUNT = 4
 const DIGEST_PRELOAD_STAGGER_MS = 220
 const WATCH_PRELOAD_COUNT = 4
 const WATCH_PRELOAD_STAGGER_MS = 320
+const FINANCE_SOURCES = new Set(['Bloomberg Markets', 'WSJ Markets'])
+const SPORTS_SOURCES = new Set(['ESPN', 'BBC Sport'])
+const ALL_VISUAL_CATEGORY_ORDER = ['Tech', 'Business', 'Sports', 'World', 'Science']
+const ALL_LIST_CATEGORY_ORDER = ['Finance', 'Tech', 'Business', 'Sports', 'World', 'Science']
 
-const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'World', 'Science']
+const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'Finance', 'World', 'Science']
 const API = apiUrl('/api')
 function getRequiredWatchMediaCount(item: NewsItem) {
   return Math.max(0, WATCH_IMAGE_TARGET - (item.image ? 1 : 0))
@@ -71,6 +75,14 @@ function getRenderableSourceImage(item: NewsItem) {
 function getImageQuality(item: NewsItem): 'high' | 'medium' | 'low' | 'fallback' {
   if (!item.image) return 'fallback'
   return item.imageQuality || 'medium'
+}
+
+function isFinanceStory(item: NewsItem) {
+  return item.category === 'Finance' || FINANCE_SOURCES.has(item.source)
+}
+
+function isSportsStory(item: NewsItem) {
+  return item.category === 'Sports' || SPORTS_SOURCES.has(item.source)
 }
 
 function NewsImage({ src, fallbackSrc, eager = false }: { src: string; fallbackSrc?: string; eager?: boolean }) {
@@ -604,10 +616,72 @@ function App() {
   }, [watch])
 
   const open = (url: string) => window.open(url, '_blank', 'noopener,noreferrer')
-  const hero = news[0]
-  const pair = news.slice(1, 3)
-  const middle = news.slice(3, 7)
-  const rest = news.slice(7, 17)
+  const indexedNews = news.map((item, index) => ({ item, index }))
+  let heroRef = indexedNews[0]
+  let pairRefs = indexedNews.slice(1, 3)
+  let middleRefs = indexedNews.slice(3, 7)
+  let listRefs = indexedNews.slice(7, 17)
+
+  if (tab === 'All') {
+    const visualRefs: Array<{ item: NewsItem; index: number }> = []
+    const selectedVisualIds = new Set<string>()
+
+    for (let round = 0; round < 2; round += 1) {
+      for (const category of ALL_VISUAL_CATEGORY_ORDER) {
+        const nextItem = indexedNews
+          .filter(({ item }) => item.category === category && !isFinanceStory(item) && hasSourceImage(item) && !selectedVisualIds.has(item.id))[0]
+        if (!nextItem) continue
+        visualRefs.push(nextItem)
+        selectedVisualIds.add(nextItem.item.id)
+      }
+    }
+
+    if (visualRefs.length < 10) {
+      const fallbackRefs = indexedNews
+        .filter(({ item }) => !isFinanceStory(item) && hasSourceImage(item) && !selectedVisualIds.has(item.id))
+        .slice(0, 10 - visualRefs.length)
+      for (const itemRef of fallbackRefs) {
+        visualRefs.push(itemRef)
+        selectedVisualIds.add(itemRef.item.id)
+      }
+    }
+
+    const visualIds = new Set(visualRefs.map(({ item }) => item.id))
+    heroRef = visualRefs[0] || indexedNews.find(({ item }) => !isFinanceStory(item)) || indexedNews[0]
+    pairRefs = visualRefs.slice(1, 3)
+    middleRefs = visualRefs.slice(3, 10)
+    const remainingRefs = indexedNews.filter(({ item }) => !visualIds.has(item.id))
+    const selectedListIds = new Set<string>()
+    const nextListRefs: Array<{ item: NewsItem; index: number }> = []
+
+    for (let round = 0; round < 2 && nextListRefs.length < 10; round += 1) {
+      for (const category of ALL_LIST_CATEGORY_ORDER) {
+        if (nextListRefs.length >= 10) break
+        const nextItem = remainingRefs.find(({ item }) => item.category === category && !selectedListIds.has(item.id))
+        if (!nextItem) continue
+        nextListRefs.push(nextItem)
+        selectedListIds.add(nextItem.item.id)
+      }
+    }
+
+    if (nextListRefs.length < 10) {
+      const fallbackRefs = remainingRefs
+        .filter(({ item }) => !selectedListIds.has(item.id))
+        .slice(0, 10 - nextListRefs.length)
+      for (const itemRef of fallbackRefs) {
+        nextListRefs.push(itemRef)
+        selectedListIds.add(itemRef.item.id)
+      }
+    }
+
+    listRefs = nextListRefs
+  }
+
+  const hero = heroRef?.item
+  const heroIndex = heroRef?.index ?? 0
+  const pair = pairRefs
+  const middle = middleRefs
+  const rest = listRefs
   const readerItem = reader?.item || null
   const readerQuote = readerAnalysis?.keyPoints?.[0] || readerAnalysis?.tldr || readerItem?.summary || ''
   const relatedStories = readerItem ? news.filter((item) => item.id !== readerItem.id).slice(0, 3) : []
@@ -785,7 +859,7 @@ function App() {
           {/* HERO */}
           {hero && (
             <div className="wrapper">
-              <section className="hero-section" onClick={() => openArticle(hero, 0)}>
+              <section className="hero-section" onClick={() => openArticle(hero, heroIndex)}>
                 {hasSourceImage(hero) && (
                   <div className="hero-img" data-quality={getImageQuality(hero)}><NewsImage src={getRenderableSourceImage(hero)} fallbackSrc={getSourceImage(hero)} eager /></div>
                 )}
@@ -793,7 +867,7 @@ function App() {
                   <p className="hero-cat">{hero.category}</p>
                   <h2 className="hero-title">{hero.title}</h2>
                   <p className="hero-summary">{hero.summary?.slice(0, 180)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(0, 'single')} onWatch={() => openWatch(news[0], 0)} onDeep={() => deepAnalyze(news[0], 0)} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(heroIndex, 'single')} onWatch={() => openWatch(hero, heroIndex)} onDeep={() => deepAnalyze(hero, heroIndex)} />
                 </div>
               </section>
             </div>
@@ -805,15 +879,15 @@ function App() {
           {pair.length > 0 && (
             <div className="wrapper">
               <div className="two-up">
-                {pair.map(item => (
-                  <article key={item.id} className="two-up-item" onClick={() => openArticle(item, news.indexOf(item))}>
+                {pair.map(({ item, index }) => (
+                  <article key={item.id} className="two-up-item" onClick={() => openArticle(item, index)}>
                     {hasSourceImage(item) && (
                       <div className="two-up-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                     )}
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 120)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                   </article>
                 ))}
               </div>
@@ -831,8 +905,8 @@ function App() {
           {/* Story Rows (alternating image side) */}
           {middle.length > 0 && (
             <div className="wrapper story-list">
-              {middle.map(item => (
-                <article key={item.id} className="story-row" onClick={() => openArticle(item, news.indexOf(item))}>
+              {middle.map(({ item, index }) => (
+                <article key={item.id} className="story-row" onClick={() => openArticle(item, index)}>
                   {hasSourceImage(item) ? (
                     <div className="story-row-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                   ) : <div />}
@@ -840,7 +914,7 @@ function App() {
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 140)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                   </div>
                 </article>
               ))}
@@ -850,13 +924,13 @@ function App() {
           {/* Tail List */}
           {rest.length > 0 && (
             <div className="tail-list">
-              {rest.map((item, i) => (
-                <article key={item.id} className="tail-item" onClick={() => openArticle(item, news.indexOf(item))}>
+              {rest.map(({ item, index }, i) => (
+                <article key={item.id} className="tail-item" onClick={() => openArticle(item, index)}>
                   <p className="tail-number">{String(i + 1).padStart(2, '0')}</p>
                   <p className="item-cat">{item.category}</p>
                   <h3 className="item-title" style={{ fontSize: 22 }}>{item.title}</h3>
                   <p className="item-excerpt">{item.summary?.slice(0, 100)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(news.indexOf(item), 'single')} onWatch={() => openWatch(item, news.indexOf(item))} onDeep={() => deepAnalyze(item, news.indexOf(item))} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                 </article>
               ))}
             </div>
