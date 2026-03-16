@@ -40,6 +40,7 @@ interface Props {
 
 const WEATHER_RESOLVE_TIMEOUT_MS = 1800
 const AUDIO_START_TIMEOUT_MS = 4000
+const SPEECH_WORD_MS = 420
 
 function clipText(text: string, max = 220) {
   const value = String(text || "").replace(/\s+/g, " ").trim()
@@ -54,6 +55,34 @@ function normalizeSpeechText(text: string, max = 220) {
     .replace(/\s*\([^)]*\)\s*/g, " ")
     .replace(/\s+/g, " ")
     .trim()
+}
+
+function formatPlaybackTime(ms: number) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${String(seconds).padStart(2, "0")}`
+}
+
+function estimateSpeechDurationMs(text: string) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean).length
+  return Math.max(4000, words * SPEECH_WORD_MS)
+}
+
+function sliceSpeechFromProgress(text: string, progressRatio: number) {
+  const value = String(text || "").trim()
+  if (!value) return ""
+
+  const normalizedRatio = Math.max(0, Math.min(0.98, progressRatio))
+  if (normalizedRatio <= 0) return value
+
+  const words = value.split(/\s+/).filter(Boolean)
+  if (!words.length) return value
+
+  const targetIndex = Math.min(words.length - 1, Math.floor(words.length * normalizedRatio))
+  const sliced = words.slice(targetIndex).join(" ")
+  const sentenceStartMatch = sliced.match(/[^.!?]*[.!?]\s+(.*)$/)
+  return (sentenceStartMatch?.[1] || sliced).trim() || sliced.trim() || value
 }
 
 function lowercaseLead(text: string) {
@@ -393,16 +422,19 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const [weatherResolved, setWeatherResolved] = useState(false)
   const [weatherSource, setWeatherSource] = useState<'gps' | 'ip' | 'none'>('none')
   const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
+  const [audioDurationMs, setAudioDurationMs] = useState(0)
   const [contentByLink, setContentByLink] = useState<Record<string, ArticleContent>>({})
   const [loadingByLink, setLoadingByLink] = useState<Record<string, boolean>>({})
   const [failedByLink, setFailedByLink] = useState<Record<string, boolean>>({})
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioStartTimerRef = useRef<number | null>(null)
+  const speechProgressTimerRef = useRef<number | null>(null)
   const playbackRequestIdRef = useRef(0)
   const pendingAutoPlayIdxRef = useRef<number | null>(null)
   const pendingContentRequestsRef = useRef<Record<string, Promise<ArticleContent | null>>>({})
   const audioUrlCacheRef = useRef<Record<string, string>>({})
   const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
+  const resumeProgressRef = useRef(0)
   const sessionIdRef = useRef(createAudioSessionId("listen"))
 
   const current = articles[idx]
@@ -566,6 +598,9 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   }, [])
 
   useEffect(() => {
+    resumeProgressRef.current = 0
+    setAudioDurationMs(0)
+    setUsingSpeechFallback(false)
     setExpanded(true)
     setIdx(startIdx)
     setProgress(0)
@@ -613,6 +648,10 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
   useEffect(() => {
     return () => {
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
       Object.values(audioUrlCacheRef.current).forEach((url) => {
         URL.revokeObjectURL(url)
       })
@@ -680,6 +719,10 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
     }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel()
     }
@@ -689,7 +732,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
   if (!current) return null
 
+  const displayedDurationMs = audioDurationMs || estimateSpeechDurationMs(script)
+  const displayedElapsedMs = Math.round((Math.max(0, Math.min(progress, 100)) / 100) * displayedDurationMs)
+
   function doStop() {
+    resumeProgressRef.current = Math.max(0, Math.min(1, progress / 100))
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
@@ -697,6 +744,10 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     if (audioStartTimerRef.current !== null) {
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
+    }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
     }
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel()
@@ -707,6 +758,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
   function advanceToNextStory() {
     setProgress(100)
+    resumeProgressRef.current = 0
+    setAudioDurationMs(0)
     if (isQueueMode && idx < articles.length - 1) {
       pendingAutoPlayIdxRef.current = idx + 1
       setIdx((value) => value + 1)
@@ -716,7 +769,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     }
   }
 
-  function playWithSpeechFallback() {
+  function playWithSpeechFallback(startRatio = resumeProgressRef.current) {
     if (!('speechSynthesis' in window) || !script.trim()) {
       setPlaying(false)
       setUsingSpeechFallback(false)
@@ -731,19 +784,52 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
     }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
 
     window.speechSynthesis.cancel()
 
-    const utterance = new SpeechSynthesisUtterance(script)
+    const boundedRatio = Math.max(0, Math.min(0.98, startRatio))
+    const totalDurationMs = estimateSpeechDurationMs(script)
+    const remainingDurationMs = Math.max(1200, Math.round(totalDurationMs * (1 - boundedRatio)))
+    const spokenText = sliceSpeechFromProgress(script, boundedRatio)
+    if (!spokenText) {
+      advanceToNextStory()
+      return
+    }
+
+    const utterance = new SpeechSynthesisUtterance(spokenText)
     const availableVoices = window.speechSynthesis.getVoices()
     const englishVoice = availableVoices.find((voice) => /en-/i.test(voice.lang)) || availableVoices[0]
     if (englishVoice) utterance.voice = englishVoice
     utterance.rate = 1
     utterance.pitch = 1
+    setAudioDurationMs(totalDurationMs)
+    setProgress(boundedRatio * 100)
+    resumeProgressRef.current = boundedRatio
+
+    const startedAt = performance.now()
+    speechProgressTimerRef.current = window.setInterval(() => {
+      const elapsedRatio = Math.min(1, (performance.now() - startedAt) / remainingDurationMs)
+      const nextRatio = boundedRatio + ((1 - boundedRatio) * elapsedRatio)
+      setProgress(nextRatio * 100)
+      resumeProgressRef.current = nextRatio
+    }, 120)
+
     utterance.onend = () => {
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
       advanceToNextStory()
     }
     utterance.onerror = () => {
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
       setPlaying(false)
       setUsingSpeechFallback(false)
     }
@@ -754,10 +840,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     window.speechSynthesis.speak(utterance)
   }
 
-  function doPlay() {
+  function doPlay(startRatio = resumeProgressRef.current) {
+    const boundedRatio = Math.max(0, Math.min(0.98, startRatio))
     if (shouldPreferBrowserSpeech) {
       requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
-      playWithSpeechFallback()
+      playWithSpeechFallback(boundedRatio)
       return
     }
 
@@ -769,12 +856,12 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
     setPlaying(true)
     setUsingSpeechFallback(false)
-    setProgress(0)
+    setProgress(boundedRatio * 100)
     const playbackRequestId = playbackRequestIdRef.current + 1
     playbackRequestIdRef.current = playbackRequestId
     const fallbackToSpeech = () => {
       if (playbackRequestIdRef.current !== playbackRequestId) return
-      playWithSpeechFallback()
+      playWithSpeechFallback(boundedRatio)
     }
     const allowGreeting = shouldAllowGreeting(idx)
     const requestUrl = buildTtsRequestUrl(script, currentVoice?.id, allowGreeting)
@@ -785,6 +872,14 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
       const audio = new Audio(sourceUrl)
       audioRef.current = audio
+      audio.preload = "auto"
+      audio.onloadedmetadata = () => {
+        if (!audio.duration || !Number.isFinite(audio.duration)) return
+        setAudioDurationMs(Math.round(audio.duration * 1000))
+        if (boundedRatio > 0) {
+          audio.currentTime = audio.duration * boundedRatio
+        }
+      }
       audio.oncanplay = () => {
         if (audioStartTimerRef.current !== null) {
           window.clearTimeout(audioStartTimerRef.current)
@@ -795,7 +890,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         advanceToNextStory()
       }
       audio.ontimeupdate = () => {
-        if (audio.duration) setProgress((audio.currentTime / audio.duration) * 100)
+        if (audio.duration) {
+          const nextProgress = (audio.currentTime / audio.duration) * 100
+          setProgress(nextProgress)
+          resumeProgressRef.current = Math.max(0, Math.min(1, nextProgress / 100))
+        }
       }
       audio.onerror = () => {
         fallbackToSpeech()
@@ -836,12 +935,37 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     }
 
     pendingAutoPlayIdxRef.current = null
-    doPlay()
+    doPlay(resumeProgressRef.current)
+  }
+
+  function seekToProgress(nextProgress: number) {
+    const clampedProgress = Math.max(0, Math.min(100, nextProgress))
+    const nextRatio = clampedProgress / 100
+    setProgress(clampedProgress)
+    resumeProgressRef.current = nextRatio
+
+    if (usingSpeechFallback || shouldPreferBrowserSpeech) {
+      if (playing) {
+        playWithSpeechFallback(nextRatio)
+      }
+      return
+    }
+
+    if (audioRef.current?.duration && Number.isFinite(audioRef.current.duration)) {
+      audioRef.current.currentTime = audioRef.current.duration * nextRatio
+      return
+    }
+
+    if (playing) {
+      doPlay(nextRatio)
+    }
   }
 
   function next() {
     if (!isQueueMode) return
     doStop()
+    resumeProgressRef.current = 0
+    setAudioDurationMs(0)
     setProgress(0)
     if (idx < articles.length - 1) setIdx((value) => value + 1)
   }
@@ -849,6 +973,8 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   function prev() {
     if (!isQueueMode) return
     doStop()
+    resumeProgressRef.current = 0
+    setAudioDurationMs(0)
     setProgress(0)
     if (idx > 0) setIdx((value) => value - 1)
   }
@@ -939,8 +1065,22 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       </div>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{current.title}</div>
       <div style={{ fontSize: 11, color: panelMuted, marginBottom: 10 }}>{isQueueMode ? `${idx + 1} / ${articles.length}` : `1 / ${visibleCount || 1}`}</div>
-      <div style={{ height: 4, background: panelSoft, borderRadius: 999, marginBottom: 12, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: progress + "%", background: accent, borderRadius: 999, transition: "width 0.3s" }} />
+      <div style={{ display: "grid", gap: 8, marginBottom: 12 }}>
+        <input
+          className="podcast-progress-slider"
+          type="range"
+          min={0}
+          max={100}
+          step={0.1}
+          value={progress}
+          onChange={(event) => seekToProgress(Number(event.target.value))}
+          aria-label="Seek playback"
+          style={{ ["--progress" as string]: `${progress}%`, ["--accent" as string]: accent, ["--track" as string]: panelSoft } as CSSProperties}
+        />
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 10, color: panelMuted, letterSpacing: 0.2 }}>
+          <span>{formatPlaybackTime(displayedElapsedMs)}</span>
+          <span>{formatPlaybackTime(displayedDurationMs)}</span>
+        </div>
       </div>
       <div style={{ display: "flex", justifyContent: "center", gap: 16, alignItems: "center" }}>
         <button onClick={prev} style={{ ...cb, opacity: isQueueMode ? 1 : 0.4, cursor: isQueueMode ? 'pointer' : 'default' }}><SkipBack size={16} /></button>
