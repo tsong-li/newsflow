@@ -28,6 +28,9 @@ Optional but supported:
 - `AZURE_OPENAI_API_KEY`
 - `AZURE_OPENAI_DEPLOYMENT`
 - `AZURE_SPEECH_ENDPOINT`
+- `AZURE_SPEECH_KEY_BACKUP`
+- `AZURE_SPEECH_REGION_BACKUP`
+- `AZURE_SPEECH_ENDPOINT_BACKUP`
 - `PEXELS_API_KEY`
 - `UNSPLASH_ACCESS_KEY`
 - `TTS_STRICT_AZURE`
@@ -50,6 +53,7 @@ Defaults already wired in code:
 
 - `AZURE_SPEECH_REGION` can be either the plain region name like `eastasia` or a full Azure endpoint URL. The server now normalizes both.
 - If you prefer, set `AZURE_SPEECH_ENDPOINT` directly, for example `https://eastasia.tts.speech.microsoft.com/cognitiveservices/v1`.
+- You can also configure `AZURE_SPEECH_KEY_BACKUP` with `AZURE_SPEECH_REGION_BACKUP` or `AZURE_SPEECH_ENDPOINT_BACKUP` as a standby Azure Speech resource. The server will automatically fail over to the backup resource if the primary one is rejected.
 - In production, `TTS_STRICT_AZURE=true` is recommended so Azure failures return `502` instead of silently falling back to `gtts`.
 
 ## Render steps

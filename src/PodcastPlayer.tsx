@@ -531,7 +531,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   }
 
   function buildTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
-    let url = "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
+    let url = "/api/tts?rewrite=0&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
     if (maxChars) url += "&maxChars=" + maxChars
     return apiUrl(url)
   }

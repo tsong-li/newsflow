@@ -173,7 +173,7 @@ function App() {
     return request
   }
 
-  function openPodcast(startIdx: number, mode: 'queue' | 'single' = 'single') {
+  function openPodcast(startIdx: number, mode: 'queue' | 'single' = 'queue') {
     setPodcastIdx(startIdx)
     setPodcastMode(mode)
     setPodcastAutoPlayToken((value) => value + 1)
@@ -737,7 +737,7 @@ function App() {
                 <p>{readerItem.time}</p>
               </div>
               <div className="reader-actions">
-                <button className="reader-action" onClick={() => openPodcast(reader.idx, 'single')}><Headphones size={15} /> Listen</button>
+                <button className="reader-action" onClick={() => openPodcast(reader.idx, 'queue')}><Headphones size={15} /> Listen</button>
                 <button className="reader-action" onClick={() => openWatch(readerItem, reader.idx)}><Play size={15} /> Watch</button>
                 <button className="reader-action" onClick={() => deepAnalyze(readerItem, reader.idx)}><Brain size={15} /> Digest</button>
                 <button className="reader-action" onClick={() => open(readerItem.link)}><ArrowUpRight size={15} /> Original</button>
@@ -869,7 +869,7 @@ function App() {
                   <p className="hero-cat">{hero.category}</p>
                   <h2 className="hero-title">{hero.title}</h2>
                   <p className="hero-summary">{hero.summary?.slice(0, 180)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(heroIndex, 'single')} onWatch={() => openWatch(hero, heroIndex)} onDeep={() => deepAnalyze(hero, heroIndex)} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(heroIndex, 'queue')} onWatch={() => openWatch(hero, heroIndex)} onDeep={() => deepAnalyze(hero, heroIndex)} />
                 </div>
               </section>
             </div>
@@ -889,7 +889,7 @@ function App() {
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 120)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'queue')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                   </article>
                 ))}
               </div>
@@ -916,7 +916,7 @@ function App() {
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
                     <p className="item-excerpt">{item.summary?.slice(0, 140)}</p>
-                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
+                    <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'queue')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                   </div>
                 </article>
               ))}
@@ -932,7 +932,7 @@ function App() {
                   <p className="item-cat">{item.category}</p>
                   <h3 className="item-title" style={{ fontSize: 22 }}>{item.title}</h3>
                   <p className="item-excerpt">{item.summary?.slice(0, 100)}</p>
-                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'single')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
+                  <Modes onClick={e => e.stopPropagation()} onListen={() => openPodcast(index, 'queue')} onWatch={() => openWatch(item, index)} onDeep={() => deepAnalyze(item, index)} />
                 </article>
               ))}
             </div>
