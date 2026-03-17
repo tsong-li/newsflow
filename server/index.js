@@ -57,8 +57,6 @@ const ANALYZE_CACHE_TTL = 60 * 60 * 1000
 const PERSISTENT_ASSET_CACHE_TTL = 24 * 60 * 60 * 1000
 const EXTERNAL_PAGE_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_PAGE_FETCH_TIMEOUT_MS) || 2500
 const OG_IMAGE_FETCH_TIMEOUT_MS = Number(process.env.OG_IMAGE_FETCH_TIMEOUT_MS) || 1500
-const AZURE_SPEECH_MAX_RETRIES = Math.max(0, Number(process.env.AZURE_SPEECH_MAX_RETRIES) || 2)
-const AZURE_SPEECH_RETRY_BASE_DELAY_MS = Math.max(250, Number(process.env.AZURE_SPEECH_RETRY_BASE_DELAY_MS) || 1200)
 const TRUE_PATTERN = /^(1|true|yes|on)$/i
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY
 const SILICONFLOW_MODEL = process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
@@ -429,55 +427,28 @@ function resolveAzureSpeechVoice(requestedVoice) {
   return AZURE_SPEECH_VOICE
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function parseRetryAfterMs(value, fallbackMs) {
-  const numeric = Number(value)
-  if (Number.isFinite(numeric) && numeric > 0) return Math.max(fallbackMs, numeric * 1000)
-
-  const timestamp = Date.parse(String(value || ''))
-  if (Number.isFinite(timestamp)) {
-    return Math.max(fallbackMs, timestamp - Date.now())
-  }
-
-  return fallbackMs
-}
-
 async function synthesizeAzureSpeech(text, voiceName) {
   const selectedVoice = resolveAzureSpeechVoice(voiceName)
   const ssml = `<?xml version="1.0" encoding="utf-8"?><speak version="1.0" xml:lang="en-US"><voice name="${selectedVoice}"><prosody rate="0%" pitch="0%">${escapeSsml(text)}</prosody></voice></speak>`
-  for (let attempt = 0; attempt <= AZURE_SPEECH_MAX_RETRIES; attempt += 1) {
-    const resp = await fetch(AZURE_SPEECH_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
-        'Content-Type': 'application/ssml+xml',
-        'X-Microsoft-OutputFormat': AZURE_SPEECH_OUTPUT_FORMAT,
-        'User-Agent': 'NewsFlow',
-      },
-      body: ssml,
-    })
+  const resp = await fetch(AZURE_SPEECH_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': AZURE_SPEECH_OUTPUT_FORMAT,
+      'User-Agent': 'NewsFlow',
+    },
+    body: ssml,
+  })
 
-    if (resp.ok) {
-      return {
-        audioBuffer: Buffer.from(await resp.arrayBuffer()),
-        voiceName: selectedVoice,
-      }
-    }
-
-    const shouldRetry = [429, 500, 502, 503, 504].includes(resp.status) && attempt < AZURE_SPEECH_MAX_RETRIES
-    if (!shouldRetry) {
-      throw new Error('Azure Speech request failed with status ' + resp.status)
-    }
-
-    const fallbackDelayMs = AZURE_SPEECH_RETRY_BASE_DELAY_MS * (attempt + 1)
-    const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'), fallbackDelayMs)
-    await sleep(retryAfterMs)
+  if (!resp.ok) {
+    throw new Error('Azure Speech request failed with status ' + resp.status)
   }
 
-  throw new Error('Azure Speech request failed after retries')
+  return {
+    audioBuffer: Buffer.from(await resp.arrayBuffer()),
+    voiceName: selectedVoice,
+  }
 }
 
 function toArray(value) {

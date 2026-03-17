@@ -39,7 +39,7 @@ interface Props {
 }
 
 const WEATHER_RESOLVE_TIMEOUT_MS = 1800
-const AUDIO_START_TIMEOUT_MS = 15000
+const AUDIO_START_TIMEOUT_MS = 8000
 const SPEECH_WORD_MS = 420
 const TIMER_PRESETS = [5, 15, 20, 30, 45, 60] as const
 const TTS_CHARS_PER_MINUTE = 900
@@ -745,6 +745,41 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
     void preloadAudio(playbackScript, currentVoice?.id, shouldAllowGreeting(idx), charBudget)
   }, [charBudget, current?.link, currentVoice?.id, idx, isQueueMode, playbackScript, startIdx, weatherResolved])
+
+  useEffect(() => {
+    if (!isQueueMode) return
+
+    const nextIndex = idx + 1
+    const nextArticle = articles[nextIndex]
+    if (!nextArticle) return
+
+    let cancelled = false
+
+    void ensureArticleContent(nextArticle).then((nextContent) => {
+      if (cancelled) return
+
+      const nextCurrentVoice = buildVoiceForIndex(nextIndex)
+      const nextFollowingVoice = buildVoiceForIndex(nextIndex + 1)
+      const nextScript = buildArticleNarration(
+        nextArticle,
+        nextContent,
+        nextIndex,
+        articles.length,
+        weatherContext,
+        false,
+        true,
+        nextCurrentVoice?.label,
+        nextFollowingVoice?.label,
+        charBudget,
+      )
+
+      void preloadAudio(nextScript, nextCurrentVoice?.id, shouldAllowGreeting(nextIndex), charBudget)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [articles, charBudget, idx, isQueueMode, startIdx, weatherContext])
 
   useEffect(() => {
     const pendingSwitch = pendingTimerSwitchRef.current

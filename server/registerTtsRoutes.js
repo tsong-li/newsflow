@@ -1,5 +1,4 @@
 function registerTtsRoutes(app, deps) {
-  const pendingTtsAudioRequests = {}
   const {
     GTTS,
     CACHE_TTL,
@@ -78,80 +77,63 @@ function registerTtsRoutes(app, deps) {
         return res.end(diskCached.buffer)
       }
 
-      const resolvedAudio = pendingTtsAudioRequests[ttsCacheKey] || (async () => {
-        const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars) : text
+      const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars) : text
 
-        if (hasAzureSpeechConfig()) {
-          try {
-            const { audioBuffer, voiceName } = await synthesizeAzureSpeech(spokenText, requestedVoice)
-            const payload = {
-              buffer: audioBuffer,
-              contentType: 'audio/mpeg',
-              contentLength: audioBuffer.length,
+      if (hasAzureSpeechConfig()) {
+        try {
+          const { audioBuffer, voiceName } = await synthesizeAzureSpeech(spokenText, requestedVoice)
+          await persistentTtsCache.set(ttsCacheKey, {
+            buffer: audioBuffer,
+            contentType: 'audio/mpeg',
+            contentLength: audioBuffer.length,
+            etag: ttsResponseEtag,
+            provider: 'azure-speech',
+            voiceName,
+            rewritten: rewriteRequested ? 'true' : 'false',
+          })
+          res.setHeader('Content-Type', 'audio/mpeg')
+          res.setHeader('X-TTS-Provider', 'azure-speech')
+          res.setHeader('X-TTS-Voice', voiceName)
+          res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
+          res.setHeader('Content-Length', String(audioBuffer.length))
+          return res.end(audioBuffer)
+        } catch (error) {
+          console.error('Azure Speech error:', error.message)
+          if (strictAzure) {
+            return res.status(502).json({
+              error: 'Azure Speech failed',
               provider: 'azure-speech',
-              voiceName,
-              rewritten: rewriteRequested ? 'true' : 'false',
-            }
-            await persistentTtsCache.set(ttsCacheKey, {
-              ...payload,
-              etag: ttsResponseEtag,
+              detail: error.message,
             })
-            return payload
-          } catch (error) {
-            console.error('Azure Speech error:', error.message)
-            if (strictAzure) {
-              throw error
-            }
           }
         }
-
-        const gtts = new GTTS(spokenText, 'en')
-        const chunks = []
-        const buffer = await new Promise((resolve, reject) => {
-          gtts.stream()
-            .on('data', (chunk) => chunks.push(chunk))
-            .on('end', () => resolve(Buffer.concat(chunks)))
-            .on('error', reject)
-        })
-
-        const payload = {
-          buffer,
-          contentType: 'audio/mpeg',
-          contentLength: buffer.length,
-          provider: 'gtts',
-          rewritten: rewriteRequested ? 'true' : 'false',
-          fallbackFrom: 'azure-speech',
-        }
-
-        await persistentTtsCache.set(ttsCacheKey, {
-          ...payload,
-          etag: ttsResponseEtag,
-        })
-
-        return payload
-      })()
-        .finally(() => {
-          delete pendingTtsAudioRequests[ttsCacheKey]
-        })
-
-      pendingTtsAudioRequests[ttsCacheKey] = resolvedAudio
-
-      try {
-        const audioPayload = await resolvedAudio
-        res.setHeader('Content-Type', audioPayload.contentType)
-        res.setHeader('X-TTS-Provider', audioPayload.provider)
-        if (audioPayload.voiceName) res.setHeader('X-TTS-Voice', audioPayload.voiceName)
-        if (audioPayload.fallbackFrom) res.setHeader('X-TTS-Fallback-From', audioPayload.fallbackFrom)
-        res.setHeader('X-TTS-Rewritten', audioPayload.rewritten)
-        res.setHeader('Content-Length', String(audioPayload.contentLength))
-        return res.end(audioPayload.buffer)
-      } catch (error) {
-        return res.status(502).json({
-          error: 'Azure Speech failed',
-          provider: 'azure-speech',
-          detail: error.message,
-        })
       }
+
+      const gtts = new GTTS(spokenText, 'en')
+      const chunks = []
+      const buffer = await new Promise((resolve, reject) => {
+        gtts.stream()
+          .on('data', (chunk) => chunks.push(chunk))
+          .on('end', () => resolve(Buffer.concat(chunks)))
+          .on('error', reject)
+      })
+
+      await persistentTtsCache.set(ttsCacheKey, {
+        buffer,
+        contentType: 'audio/mpeg',
+        contentLength: buffer.length,
+        etag: ttsResponseEtag,
+        provider: 'gtts',
+        rewritten: rewriteRequested ? 'true' : 'false',
+        fallbackFrom: 'azure-speech',
+      })
+
+      res.setHeader('Content-Type', 'audio/mpeg')
+      res.setHeader('X-TTS-Provider', 'gtts')
+      res.setHeader('X-TTS-Fallback-From', 'azure-speech')
+      res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
+      res.setHeader('Content-Length', String(buffer.length))
+      return res.end(buffer)
     } catch (error) {
       console.error('TTS error:', error)
       return res.status(500).json({ error: 'TTS failed' })
