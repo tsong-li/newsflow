@@ -1,9 +1,8 @@
-import PodcastPlayer, { buildArticleNarration, buildListenTtsRequestUrl, buildWeatherContext } from './PodcastPlayer'
+import PodcastPlayer from './PodcastPlayer'
 import WatchPlayer from './WatchPlayer'
-import { apiUrl, preloadAudioUrl, preloadImageUrl, preloadVideoAsset, proxiedImageUrl } from './api'
+import { apiUrl, proxiedImageUrl } from './api'
 import React, { startTransition, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, ArrowUpRight, Headphones, Play, Brain, Sparkles, Loader2, X } from 'lucide-react'
-import { pickSequentialTtsVoice } from './ttsVoices'
 
 interface NewsItem {
   id: string; category: string; title: string; summary: string
@@ -46,13 +45,14 @@ interface ArticleMedia {
 }
 
 const WATCH_IMAGE_TARGET = 4
-const CATEGORY_VISUAL_PRELOAD_COUNT = 8
-const LISTEN_AUDIO_PRELOAD_COUNT = 4
+const DIGEST_PRELOAD_COUNT = 4
+const DIGEST_PRELOAD_STAGGER_MS = 220
+const WATCH_PRELOAD_COUNT = 4
+const WATCH_PRELOAD_STAGGER_MS = 320
 const FINANCE_SOURCES = new Set(['Bloomberg Markets', 'WSJ Markets'])
 const SPORTS_SOURCES = new Set(['ESPN', 'BBC Sport'])
 const ALL_VISUAL_CATEGORY_ORDER = ['Tech', 'Business', 'Sports', 'World', 'Science']
 const ALL_LIST_CATEGORY_ORDER = ['Finance', 'Tech', 'Business', 'Sports', 'World', 'Science']
-const STORY_PRELOAD_ROOT_MARGIN = '320px 0px'
 
 const CATEGORIES = ['All', 'Tech', 'Business', 'Sports', 'Finance', 'World', 'Science']
 const API = apiUrl('/api')
@@ -85,39 +85,15 @@ function isSportsStory(item: NewsItem) {
   return item.category === 'Sports' || SPORTS_SOURCES.has(item.source)
 }
 
-function NewsImage({ src, fallbackSrc, eager = false, onVisible }: { src: string; fallbackSrc?: string; eager?: boolean; onVisible?: () => void }) {
+function NewsImage({ src, fallbackSrc, eager = false }: { src: string; fallbackSrc?: string; eager?: boolean }) {
   const [resolvedSrc, setResolvedSrc] = useState(src)
-  const imageRef = useRef<HTMLImageElement | null>(null)
 
   useEffect(() => {
     setResolvedSrc(src)
   }, [src])
 
-  useEffect(() => {
-    if (!onVisible) return
-
-    if (eager || typeof IntersectionObserver === 'undefined') {
-      onVisible()
-      return
-    }
-
-    const node = imageRef.current
-    if (!node) return
-
-    const observer = new IntersectionObserver((entries) => {
-      const entry = entries[0]
-      if (!entry?.isIntersecting) return
-      observer.disconnect()
-      onVisible()
-    }, { rootMargin: STORY_PRELOAD_ROOT_MARGIN })
-
-    observer.observe(node)
-    return () => observer.disconnect()
-  }, [eager, onVisible, src])
-
   return (
     <img
-      ref={imageRef}
       className="news-image"
       src={resolvedSrc}
       alt=""
@@ -168,178 +144,16 @@ function App() {
   const categoryCacheRef = useRef<Record<string, NewsItem[]>>({})
   const pendingRequestsRef = useRef<Record<string, Promise<NewsItem[]>>>({})
   const prefetchedRef = useRef(false)
-  const categoryHeroWarmRef = useRef<Record<string, string>>({})
   const analysisCacheRef = useRef<Record<string, AnalysisState>>({})
   const pendingAnalysisRef = useRef<Record<string, Promise<AnalysisState>>>({})
   const analysisPrefetchRef = useRef<Record<string, boolean>>({})
   const watchPrefetchRef = useRef<Record<string, boolean>>({})
-  const visualWarmRef = useRef<Record<string, string>>({})
   const contentCacheRef = useRef<Record<string, ArticleContent>>({})
   const pendingContentRef = useRef<Record<string, Promise<ArticleContent>>>({})
   const mediaCacheRef = useRef<Record<string, string[]>>({})
   const pendingMediaRef = useRef<Record<string, Promise<string[]>>>({})
   const videoCacheRef = useRef<Record<string, ArticleVideo | null>>({})
   const pendingVideoRef = useRef<Record<string, Promise<ArticleVideo | null>>>({})
-  const listenAudioWarmRef = useRef<Record<string, string>>({})
-  const listenWeatherContextRef = useRef(buildWeatherContext())
-
-  function warmListenAudio(item: NewsItem, idx: number, items: NewsItem[], mode: 'single' | 'queue' = 'single') {
-    if (!item) return
-
-    const startIdx = mode === 'queue' ? 0 : idx
-    const sequenceIndex = Math.max(0, idx - startIdx)
-    const voiceSeed = `${items[startIdx]?.title || item.title}|${items[startIdx]?.source || ''}|${startIdx}`
-    const currentVoice = pickSequentialTtsVoice(voiceSeed, sequenceIndex, 'listen')
-    const nextVoice = mode === 'queue' && idx < items.length - 1
-      ? pickSequentialTtsVoice(voiceSeed, sequenceIndex + 1, 'listen')
-      : null
-    const script = buildArticleNarration(
-      item,
-      null,
-      mode === 'queue' ? idx : 0,
-      mode === 'queue' ? items.length : 1,
-      listenWeatherContextRef.current,
-      mode === 'queue' && idx === startIdx,
-      mode === 'queue',
-      currentVoice?.label,
-      nextVoice?.label,
-    )
-
-    if (!script.trim()) return
-
-    const requestUrl = buildListenTtsRequestUrl(script, currentVoice?.id, mode === 'queue' && idx === startIdx)
-    const cacheKey = `${mode}::${item.link}::${currentVoice?.id || 'default'}::${script}`
-    if (listenAudioWarmRef.current[cacheKey] === requestUrl) return
-
-    listenAudioWarmRef.current[cacheKey] = requestUrl
-    void preloadAudioUrl(requestUrl).catch(() => {
-      delete listenAudioWarmRef.current[cacheKey]
-    })
-  }
-
-  function warmListenAudioBatch(items: NewsItem[], mode: 'single' | 'queue' = 'single', limit = LISTEN_AUDIO_PRELOAD_COUNT) {
-    items.slice(0, limit).forEach((item, index) => {
-      warmListenAudio(item, index, items, mode === 'queue' && index === 0 ? 'queue' : 'single')
-    })
-  }
-
-  function warmVisualAssets(item: NewsItem, media: string[] = [], video: ArticleVideo | null = null) {
-    const key = item.link
-    const posterUrl = proxiedImageUrl(video?.poster || '') || video?.poster || ''
-    const signature = JSON.stringify({
-      base: getRenderableSourceImage(item),
-      media: media.slice(0, WATCH_IMAGE_TARGET),
-      videoUrl: video?.url || '',
-      posterUrl,
-    })
-
-    if (visualWarmRef.current[key] === signature) return
-    visualWarmRef.current[key] = signature
-
-    const imageUrls = [getRenderableSourceImage(item), ...media]
-      .filter(Boolean)
-      .slice(0, WATCH_IMAGE_TARGET)
-
-    imageUrls.forEach((url, index) => {
-      window.setTimeout(() => {
-        void preloadImageUrl(url)
-      }, index * 40)
-    })
-
-    if (video?.url) {
-      void preloadVideoAsset(video.url, video.kind, posterUrl)
-    }
-  }
-
-  function markStoryVisible(item: NewsItem, idx: number) {
-    const key = getAnalysisKey(item)
-
-    warmVisualAssets(item)
-    warmListenAudio(item, idx, news, 'single')
-
-    if (!analysisPrefetchRef.current[key]) {
-      analysisPrefetchRef.current[key] = true
-      fetchAnalysis(item, idx).catch(() => {
-        delete analysisPrefetchRef.current[key]
-      })
-    }
-
-    void preloadWatchAssets(item, idx).catch(() => {})
-  }
-
-  function getCategoryHeroCandidate(category: string, items: NewsItem[]) {
-    if (!items.length) return null
-
-    if (category === 'All') {
-      return items.find((item) => !isFinanceStory(item) && hasSourceImage(item))
-        || items.find((item) => hasSourceImage(item))
-        || items[0]
-    }
-
-    return items.find((item) => hasSourceImage(item)) || items[0]
-  }
-
-  function warmCategoryHero(category: string, items: NewsItem[]) {
-    const heroCandidate = getCategoryHeroCandidate(category, items)
-    if (!heroCandidate) return
-
-    const heroUrl = getRenderableSourceImage(heroCandidate)
-    if (!heroUrl) return
-    if (categoryHeroWarmRef.current[category] === heroUrl) return
-
-    categoryHeroWarmRef.current[category] = heroUrl
-    void preloadImageUrl(heroUrl)
-  }
-
-  function getCategoryVisualCandidates(category: string, items: NewsItem[]) {
-    if (!items.length) return []
-
-    if (category === 'All') {
-      const prioritized = items.filter((item) => !isFinanceStory(item) && hasSourceImage(item))
-      const fallback = items.filter((item) => hasSourceImage(item) && !prioritized.includes(item))
-      return prioritized.concat(fallback).slice(0, CATEGORY_VISUAL_PRELOAD_COUNT)
-    }
-
-    return items.filter((item) => hasSourceImage(item)).slice(0, CATEGORY_VISUAL_PRELOAD_COUNT)
-  }
-
-  function warmCategoryVisuals(category: string, items: NewsItem[]) {
-    const candidates = getCategoryVisualCandidates(category, items)
-
-    candidates.forEach((item, index) => {
-      const url = getRenderableSourceImage(item)
-      if (!url) return
-
-      window.setTimeout(() => {
-        void preloadImageUrl(url)
-      }, index * 45)
-    })
-  }
-
-  function primeCategory(category: string) {
-    return fetchCategory(category)
-      .then((items) => {
-        warmCategoryHero(category, items)
-        warmCategoryVisuals(category, items)
-        if (items.length) {
-          warmListenAudio(items[0], 0, items, 'queue')
-          warmListenAudioBatch(items, 'single')
-        }
-        return items
-      })
-  }
-
-  function handleTabClick(category: string) {
-    if (category === tab) return
-
-    if (categoryCacheRef.current[category]) {
-      warmCategoryHero(category, categoryCacheRef.current[category])
-    } else {
-      void primeCategory(category).catch(() => {})
-    }
-
-    setTab(category)
-  }
 
   async function fetchCategory(category: string, force = false): Promise<NewsItem[]> {
     if (!force && categoryCacheRef.current[category]) return categoryCacheRef.current[category]
@@ -349,7 +163,6 @@ function App() {
       .then(r => r.json())
       .then((items: NewsItem[]) => {
         categoryCacheRef.current[category] = items
-        warmCategoryHero(category, items)
         return items
       })
       .finally(() => {
@@ -544,11 +357,6 @@ function App() {
     ]
 
     const results = await Promise.allSettled(tasks)
-    warmVisualAssets(
-      item,
-      mediaCacheRef.current[key] || [],
-      Object.prototype.hasOwnProperty.call(videoCacheRef.current, key) ? videoCacheRef.current[key] : null,
-    )
     const allFailed = results.every((result) => result.status === 'rejected')
     if (allFailed) {
       delete watchPrefetchRef.current[key]
@@ -602,7 +410,7 @@ function App() {
     prefetchedRef.current = true
     const timers = CATEGORIES.filter((category) => category !== tab).map((category, index) => (
       window.setTimeout(() => {
-        primeCategory(category).catch(() => {})
+        fetchCategory(category).catch(() => {})
       }, 180 * (index + 1))
     ))
 
@@ -612,10 +420,30 @@ function App() {
   useEffect(() => {
     if (!news.length) return
 
-    warmCategoryVisuals(tab, news)
-    warmListenAudio(news[0], 0, news, 'queue')
-    warmListenAudioBatch(news, 'single')
-  }, [tab, news])
+    const preloadItems = news.slice(0, DIGEST_PRELOAD_COUNT)
+    const timers = preloadItems.map((item, index) => window.setTimeout(() => {
+      const key = getAnalysisKey(item)
+
+      if (analysisPrefetchRef.current[key]) return
+      analysisPrefetchRef.current[key] = true
+      fetchAnalysis(item, index).catch(() => {
+        delete analysisPrefetchRef.current[key]
+      })
+    }, DIGEST_PRELOAD_STAGGER_MS * index))
+
+    return () => timers.forEach(window.clearTimeout)
+  }, [news])
+
+  useEffect(() => {
+    if (!news.length) return
+
+    const preloadItems = news.slice(0, WATCH_PRELOAD_COUNT)
+    const timers = preloadItems.map((item, index) => window.setTimeout(() => {
+      void preloadWatchAssets(item, index).catch(() => {})
+    }, WATCH_PRELOAD_STAGGER_MS * index))
+
+    return () => timers.forEach(window.clearTimeout)
+  }, [news])
 
   useEffect(() => {
     const handlePopState = () => {
@@ -1017,15 +845,7 @@ function App() {
       {/* Nav */}
       <nav className="nav">
         {CATEGORIES.map(c => (
-          <button
-            key={c}
-            className={`nav-item ${tab === c ? 'active' : ''}`}
-            onMouseEnter={() => { void primeCategory(c).catch(() => {}) }}
-            onFocus={() => { void primeCategory(c).catch(() => {}) }}
-            onMouseDown={() => { void primeCategory(c).catch(() => {}) }}
-            onTouchStart={() => { void primeCategory(c).catch(() => {}) }}
-            onClick={() => handleTabClick(c)}
-          >
+          <button key={c} className={`nav-item ${tab === c ? 'active' : ''}`} onMouseEnter={() => { void fetchCategory(c) }} onFocus={() => { void fetchCategory(c) }} onClick={() => setTab(c)}>
             {c}
           </button>
         ))}
@@ -1043,7 +863,7 @@ function App() {
             <div className="wrapper">
               <section className="hero-section" onClick={() => openArticle(hero, heroIndex)}>
                 {hasSourceImage(hero) && (
-                  <div className="hero-img" data-quality={getImageQuality(hero)}><NewsImage src={getRenderableSourceImage(hero)} fallbackSrc={getSourceImage(hero)} eager onVisible={() => markStoryVisible(hero, heroIndex)} /></div>
+                  <div className="hero-img" data-quality={getImageQuality(hero)}><NewsImage src={getRenderableSourceImage(hero)} fallbackSrc={getSourceImage(hero)} eager /></div>
                 )}
                 <div className="hero-text">
                   <p className="hero-cat">{hero.category}</p>
@@ -1064,7 +884,7 @@ function App() {
                 {pair.map(({ item, index }) => (
                   <article key={item.id} className="two-up-item" onClick={() => openArticle(item, index)}>
                     {hasSourceImage(item) && (
-                      <div className="two-up-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} onVisible={() => markStoryVisible(item, index)} /></div>
+                      <div className="two-up-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                     )}
                     <p className="item-cat">{item.category}</p>
                     <h3 className="item-title">{item.title}</h3>
@@ -1090,7 +910,7 @@ function App() {
               {middle.map(({ item, index }) => (
                 <article key={item.id} className="story-row" onClick={() => openArticle(item, index)}>
                   {hasSourceImage(item) ? (
-                    <div className="story-row-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} onVisible={() => markStoryVisible(item, index)} /></div>
+                    <div className="story-row-img" data-quality={getImageQuality(item)}><NewsImage src={getRenderableSourceImage(item)} fallbackSrc={getSourceImage(item)} /></div>
                   ) : <div />}
                   <div className="story-row-text">
                     <p className="item-cat">{item.category}</p>
