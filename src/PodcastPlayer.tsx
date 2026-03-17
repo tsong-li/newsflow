@@ -473,7 +473,7 @@ export function buildArticleNarration(
 }
 
 export function buildListenTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
-  let url = "/api/tts?rewrite=1&mode=listen&strictAzure=1&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
+  let url = "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
   if (maxChars) url += "&maxChars=" + maxChars
   return apiUrl(url)
 }
@@ -489,6 +489,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const [weatherContext, setWeatherContext] = useState<WeatherContext>(() => buildWeatherContext())
   const [weatherResolved, setWeatherResolved] = useState(true)
   const [weatherSource, setWeatherSource] = useState<'gps' | 'ip' | 'none'>('none')
+  const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
   const [audioDurationMs, setAudioDurationMs] = useState(0)
   const [contentByLink, setContentByLink] = useState<Record<string, ArticleContent>>({})
   const [loadingByLink, setLoadingByLink] = useState<Record<string, boolean>>({})
@@ -500,6 +501,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const [handoffCue, setHandoffCue] = useState<{ targetIdx: number; text: string } | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioStartTimerRef = useRef<number | null>(null)
+  const speechProgressTimerRef = useRef<number | null>(null)
   const playbackRequestIdRef = useRef(0)
   const pendingAutoPlayIdxRef = useRef<number | null>(null)
   const pendingContentRequestsRef = useRef<Record<string, Promise<ArticleContent | null>>>({})
@@ -513,6 +515,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const current = articles[idx]
   const isQueueMode = mode === 'queue'
   const visibleCount = isQueueMode ? articles.length : (current ? 1 : 0)
+  const shouldPreferBrowserSpeech = String(import.meta.env.VITE_PREFER_BROWSER_TTS || '').toLowerCase() === 'true'
   const currentContent = current?.link ? contentByLink[current.link] || null : null
   const remainingArticles = isQueueMode ? Math.max(1, articles.length - idx) : 1
   const completedArticles = isQueueMode ? Math.max(0, idx - startIdx) : 0
@@ -564,7 +567,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   }
 
   async function preloadAudio(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
-    if (!text.trim()) return null
+    if (shouldPreferBrowserSpeech || !text.trim()) return null
 
     const cacheKey = buildAudioCacheKey(text, voiceId, allowGreeting, maxChars)
     if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
@@ -669,6 +672,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   useEffect(() => {
     resumeProgressRef.current = 0
     setAudioDurationMs(0)
+    setUsingSpeechFallback(false)
     setExpanded(true)
     setShowTimerOptions(false)
     setIdx(startIdx)
@@ -735,19 +739,24 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
   useEffect(() => {
     return () => {
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
       audioUrlCacheRef.current = {}
     }
   }, [])
 
   useEffect(() => {
+    if (shouldPreferBrowserSpeech) return
     if (!current || !playbackScript.trim()) return
     if (isQueueMode && idx === startIdx && !weatherResolved) return
 
     void preloadAudio(playbackScript, currentVoice?.id, shouldAllowGreeting(idx), charBudget)
-  }, [charBudget, current?.link, currentVoice?.id, idx, isQueueMode, playbackScript, startIdx, weatherResolved])
+  }, [charBudget, current?.link, currentVoice?.id, idx, isQueueMode, playbackScript, shouldPreferBrowserSpeech, startIdx, weatherResolved])
 
   useEffect(() => {
-    if (!isQueueMode) return
+    if (!isQueueMode || shouldPreferBrowserSpeech) return
 
     const nextIndex = idx + 1
     const nextArticle = articles[nextIndex]
@@ -779,7 +788,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     return () => {
       cancelled = true
     }
-  }, [articles, charBudget, idx, isQueueMode, startIdx, weatherContext])
+  }, [articles, charBudget, idx, isQueueMode, shouldPreferBrowserSpeech, startIdx, weatherContext])
 
   useEffect(() => {
     const pendingSwitch = pendingTimerSwitchRef.current
@@ -809,7 +818,15 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
     }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
     setPlaying(false)
+    setUsingSpeechFallback(false)
   }), [])
 
   useEffect(() => {
@@ -883,7 +900,15 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
     }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
     setPlaying(false)
+    setUsingSpeechFallback(false)
   }
 
   function advanceToNextStory() {
@@ -895,24 +920,94 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       setIdx((value) => value + 1)
     } else {
       setPlaying(false)
+      setUsingSpeechFallback(false)
     }
   }
 
-  function stopAzurePlayback(playbackRequestId: number) {
-    if (playbackRequestIdRef.current !== playbackRequestId) return
-    if (audioStartTimerRef.current !== null) {
-      window.clearTimeout(audioStartTimerRef.current)
-      audioStartTimerRef.current = null
+  function playWithSpeechFallback(startRatio = resumeProgressRef.current) {
+    if (!('speechSynthesis' in window) || !script.trim()) {
+      setPlaying(false)
+      setUsingSpeechFallback(false)
+      return
     }
+
+    const playbackRequestId = playbackRequestIdRef.current + 1
+    playbackRequestIdRef.current = playbackRequestId
+
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
     }
-    setPlaying(false)
+    if (audioStartTimerRef.current !== null) {
+      window.clearTimeout(audioStartTimerRef.current)
+      audioStartTimerRef.current = null
+    }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
+
+    window.speechSynthesis.cancel()
+
+    const boundedRatio = Math.max(0, Math.min(0.98, startRatio))
+    const totalDurationMs = estimateSpeechDurationMs(playbackScript)
+    const remainingDurationMs = Math.max(1200, Math.round(totalDurationMs * (1 - boundedRatio)))
+    const spokenText = sliceSpeechFromProgress(playbackScript, boundedRatio)
+    if (!spokenText) {
+      advanceToNextStory()
+      return
+    }
+
+    const utterance = new SpeechSynthesisUtterance(spokenText)
+    const availableVoices = window.speechSynthesis.getVoices()
+    const englishVoice = availableVoices.find((voice) => /en-/i.test(voice.lang)) || availableVoices[0]
+    if (englishVoice) utterance.voice = englishVoice
+    utterance.rate = 1
+    utterance.pitch = 1
+    setAudioDurationMs(totalDurationMs)
+    setProgress(boundedRatio * 100)
+    resumeProgressRef.current = boundedRatio
+
+    const startedAt = performance.now()
+    speechProgressTimerRef.current = window.setInterval(() => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      const elapsedRatio = Math.min(1, (performance.now() - startedAt) / remainingDurationMs)
+      const nextRatio = boundedRatio + ((1 - boundedRatio) * elapsedRatio)
+      setProgress(nextRatio * 100)
+      resumeProgressRef.current = nextRatio
+    }, 120)
+
+    utterance.onend = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      advanceToNextStory()
+    }
+    utterance.onerror = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      setPlaying(false)
+      setUsingSpeechFallback(false)
+    }
+
+    setUsingSpeechFallback(true)
+    setPlaying(true)
+    setProgress(12)
+    window.speechSynthesis.speak(utterance)
   }
 
   function doPlay(startRatio = resumeProgressRef.current) {
     const boundedRatio = Math.max(0, Math.min(0.98, startRatio))
+    if (shouldPreferBrowserSpeech) {
+      requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
+      playWithSpeechFallback(boundedRatio)
+      return
+    }
 
     if (audioRef.current) {
       audioRef.current.pause()
@@ -921,9 +1016,15 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: "listen" })
     setPlaying(true)
+    setUsingSpeechFallback(false)
     setProgress(boundedRatio * 100)
     const playbackRequestId = playbackRequestIdRef.current + 1
     playbackRequestIdRef.current = playbackRequestId
+    const fallbackToSpeech = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      playbackRequestIdRef.current += 1
+      playWithSpeechFallback(boundedRatio)
+    }
     const allowGreeting = shouldAllowGreeting(idx)
     const requestUrl = buildListenTtsRequestUrl(playbackScript, currentVoice?.id, allowGreeting, charBudget)
     const cacheKey = buildAudioCacheKey(playbackScript, currentVoice?.id, allowGreeting, charBudget)
@@ -958,12 +1059,12 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         }
       }
       audio.onerror = () => {
-        stopAzurePlayback(playbackRequestId)
+        fallbackToSpeech()
       }
       audioStartTimerRef.current = window.setTimeout(() => {
-        stopAzurePlayback(playbackRequestId)
+        fallbackToSpeech()
       }, AUDIO_START_TIMEOUT_MS)
-      audio.play().catch(() => stopAzurePlayback(playbackRequestId))
+      audio.play().catch(() => fallbackToSpeech())
     }
 
     const cachedAudioUrl = audioUrlCacheRef.current[cacheKey]
@@ -973,7 +1074,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     }
 
     audioStartTimerRef.current = window.setTimeout(() => {
-      stopAzurePlayback(playbackRequestId)
+      fallbackToSpeech()
     }, AUDIO_START_TIMEOUT_MS)
 
     void (pendingAudioUrlRef.current[cacheKey] || preloadAudio(playbackScript, currentVoice?.id, allowGreeting, charBudget))
@@ -986,7 +1087,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         startAudio(preloadedUrl || requestUrl)
       })
       .catch(() => {
-        stopAzurePlayback(playbackRequestId)
+        fallbackToSpeech()
       })
   }
 
@@ -1005,6 +1106,13 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     const nextRatio = clampedProgress / 100
     setProgress(clampedProgress)
     resumeProgressRef.current = nextRatio
+
+    if (usingSpeechFallback || shouldPreferBrowserSpeech) {
+      if (playing) {
+        playWithSpeechFallback(nextRatio)
+      }
+      return
+    }
 
     if (audioRef.current?.duration && Number.isFinite(audioRef.current.duration)) {
       audioRef.current.currentTime = audioRef.current.duration * nextRatio

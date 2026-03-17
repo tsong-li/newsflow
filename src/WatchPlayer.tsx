@@ -409,6 +409,7 @@ function buildScenes(article: WatchArticle, analysis: WatchAnalysis | null, cont
 
 export default function WatchPlayer({ article, analysis, content, contentLoading = false, mediaImages = [], video = null, videoLoading = false, image, onClose }: WatchPlayerProps) {
   const [playing, setPlaying] = useState(false)
+  const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
   const [audioPreparing, setAudioPreparing] = useState(false)
   const [isScrubbing, setIsScrubbing] = useState(false)
   const [sliderProgress, setSliderProgress] = useState(0)
@@ -423,6 +424,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const [frozenImageTransform, setFrozenImageTransform] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioStartTimerRef = useRef<number | null>(null)
+  const speechProgressTimerRef = useRef<number | null>(null)
   const playbackRequestIdRef = useRef(0)
   const audioUrlCacheRef = useRef<Record<string, string>>({})
   const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
@@ -437,6 +439,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const sessionIdRef = useRef(createAudioSessionId('watch'))
 
   const baseScenes = useMemo(() => buildScenes(article, analysis, content), [article, analysis, content])
+  const shouldPreferBrowserSpeech = String(import.meta.env.VITE_PREFER_BROWSER_TTS || '').toLowerCase() === 'true'
   const watchVoice = useMemo(
     () => pickTtsVoice(`${article.title}|${article.source || ''}|${article.category || ''}`, 'watch'),
     [article],
@@ -454,7 +457,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   }), [baseScenes, sceneDurationOverrides])
 
   function buildTtsRequestUrl(narration: string) {
-    return apiUrl(`/api/tts?rewrite=0&mode=watch&strictAzure=1&text=${encodeURIComponent(narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`)
+    return apiUrl(`/api/tts?rewrite=0&mode=watch&text=${encodeURIComponent(narration.slice(0, 2000))}&voice=${encodeURIComponent(watchVoice.id)}`)
   }
 
   function buildAudioCacheKey(narration: string) {
@@ -462,7 +465,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   }
 
   async function preloadSceneAudio(narration: string) {
-    if (!narration.trim()) return null
+    if (shouldPreferBrowserSpeech || !narration.trim()) return null
 
     const cacheKey = buildAudioCacheKey(narration)
     if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
@@ -513,10 +516,10 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   useEffect(() => {
     if (!currentScene) return
     void preloadSceneAudio(currentScene.narration)
-  }, [currentScene?.id, currentScene?.narration, watchVoice.id])
+  }, [currentScene?.id, currentScene?.narration, shouldPreferBrowserSpeech, watchVoice.id])
 
   useEffect(() => {
-    if (hasOriginalVideo || !scenes.length) return
+    if (shouldPreferBrowserSpeech || hasOriginalVideo || !scenes.length) return
 
     let cancelled = false
 
@@ -530,14 +533,16 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     return () => {
       cancelled = true
     }
-  }, [hasOriginalVideo, scenes, scriptKey, watchVoice.id])
+  }, [hasOriginalVideo, scenes, scriptKey, shouldPreferBrowserSpeech, watchVoice.id])
 
   useEffect(() => {
+    if (shouldPreferBrowserSpeech) return
+
     const nextScene = scenes[sceneIndex + 1]
     if (!nextScene) return
 
     void preloadSceneAudio(nextScene.narration)
-  }, [sceneIndex, scenes, watchVoice.id])
+  }, [sceneIndex, scenes, shouldPreferBrowserSpeech, watchVoice.id])
 
   function stopNarration() {
     playbackRequestIdRef.current += 1
@@ -545,9 +550,16 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
     }
+    if (speechProgressTimerRef.current !== null) {
+      window.clearInterval(speechProgressTimerRef.current)
+      speechProgressTimerRef.current = null
+    }
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
+    }
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
     }
   }
 
@@ -589,6 +601,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
 
     setPlaying(false)
     setAudioPreparing(false)
+    setUsingSpeechFallback(false)
   }
 
   function advanceFromScene(startIndex: number, scene: WatchScene) {
@@ -600,26 +613,79 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     }
   }
 
-  function stopAzureScenePlayback(playbackRequestId: number) {
-    if (playbackRequestIdRef.current !== playbackRequestId) return
-    if (audioStartTimerRef.current !== null) {
-      window.clearTimeout(audioStartTimerRef.current)
-      audioStartTimerRef.current = null
+  function playSceneWithSpeechFallback(startIndex: number, resumeMs = 0) {
+    const scene = scenes[startIndex]
+    if (!scene) return
+
+    if (!('speechSynthesis' in window)) {
+      setUsingSpeechFallback(false)
+      advanceFromScene(startIndex, scene)
+      return
     }
-    if (audioRef.current) {
-      audioRef.current.pause()
-      audioRef.current = null
-    }
-    setPlaying(false)
+
+    stopNarration()
+  const playbackRequestId = playbackRequestIdRef.current + 1
+  playbackRequestIdRef.current = playbackRequestId
+    requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
     setAudioPreparing(false)
+    setUsingSpeechFallback(true)
+
+    const boundedResume = Math.max(0, Math.min(scene.durationMs, resumeMs))
+    setPlaying(true)
+    syncSceneProgress(startIndex, boundedResume, activeCaptionIndexForElapsed(scene, boundedResume))
+
+    const utterance = new SpeechSynthesisUtterance(scene.narration)
+    const availableVoices = window.speechSynthesis.getVoices()
+    const englishVoice = availableVoices.find((voice) => /en-/i.test(voice.lang)) || availableVoices[0]
+    if (englishVoice) utterance.voice = englishVoice
+    utterance.rate = 1
+    utterance.pitch = 1
+
+    const playbackStart = performance.now() - boundedResume
+    speechProgressTimerRef.current = window.setInterval(() => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      const elapsed = Math.max(0, Math.min(scene.durationMs, performance.now() - playbackStart))
+      syncSceneProgress(startIndex, elapsed)
+    }, 120)
+
+    utterance.onend = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      advanceFromScene(startIndex, scene)
+    }
+    utterance.onerror = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      setUsingSpeechFallback(false)
+      if (speechProgressTimerRef.current !== null) {
+        window.clearInterval(speechProgressTimerRef.current)
+        speechProgressTimerRef.current = null
+      }
+      if (startIndex < scenes.length - 1) {
+        playScene(startIndex + 1, 0)
+      } else {
+        finishPlayback()
+      }
+    }
+
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(utterance)
   }
 
   function playScene(startIndex: number, resumeMs = 0) {
     const scene = scenes[startIndex]
     if (!scene) return
 
+    if (shouldPreferBrowserSpeech) {
+      playSceneWithSpeechFallback(startIndex, resumeMs)
+      return
+    }
+
     stopNarration()
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
+    setUsingSpeechFallback(false)
     setAudioPreparing(true)
     const playbackRequestId = playbackRequestIdRef.current + 1
     playbackRequestIdRef.current = playbackRequestId
@@ -627,6 +693,17 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     const resumeCaptionIndex = activeCaptionIndexForElapsed(scene, boundedResume)
 
     syncSceneProgress(startIndex, boundedResume, resumeCaptionIndex)
+
+    const fallbackToSpeech = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
+      if (audioStartTimerRef.current !== null) {
+        window.clearTimeout(audioStartTimerRef.current)
+        audioStartTimerRef.current = null
+      }
+      if (audioRef.current) audioRef.current = null
+      playbackRequestIdRef.current += 1
+      playSceneWithSpeechFallback(startIndex, boundedResume)
+    }
 
     const startAudio = (sourceUrl: string) => {
       if (playbackRequestIdRef.current !== playbackRequestId) return
@@ -668,13 +745,13 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
       }
       audio.onerror = () => {
         setAudioPreparing(false)
-        stopAzureScenePlayback(playbackRequestId)
+        fallbackToSpeech()
       }
       audioStartTimerRef.current = window.setTimeout(() => {
-        stopAzureScenePlayback(playbackRequestId)
+        fallbackToSpeech()
       }, AUDIO_START_TIMEOUT_MS)
       audio.play().catch(() => {
-        stopAzureScenePlayback(playbackRequestId)
+        fallbackToSpeech()
       })
     }
 
@@ -686,7 +763,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     }
 
     audioStartTimerRef.current = window.setTimeout(() => {
-      stopAzureScenePlayback(playbackRequestId)
+      fallbackToSpeech()
     }, AUDIO_START_TIMEOUT_MS)
 
     void (pendingAudioUrlRef.current[cacheKey] || preloadSceneAudio(scene.narration))
@@ -699,7 +776,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
         startAudio(preloadedUrl || buildTtsRequestUrl(scene.narration))
       })
       .catch(() => {
-        stopAzureScenePlayback(playbackRequestId)
+        fallbackToSpeech()
       })
   }
 
@@ -793,23 +870,27 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     sceneResumeMsRef.current = 0
     syncSceneProgress(0, 0, 0)
 
-    setAudioPreparing(true)
-    void preloadSceneAudio(baseScenes[0].narration)
-      .then(() => {
-        if (cancelled) return
-        playScene(0, 0)
-      })
-      .catch(() => {
-        if (cancelled) return
-        playScene(0, 0)
-      })
+    if (shouldPreferBrowserSpeech) {
+      playScene(0, 0)
+    } else {
+      setAudioPreparing(true)
+      void preloadSceneAudio(baseScenes[0].narration)
+        .then(() => {
+          if (cancelled) return
+          playScene(0, 0)
+        })
+        .catch(() => {
+          if (cancelled) return
+          playScene(0, 0)
+        })
+    }
 
     return () => {
       cancelled = true
       stopNarration()
       setAudioPreparing(false)
     }
-  }, [article.title, article.source, article.category, hasOriginalVideo, videoLoading, scenes.length])
+  }, [article.title, article.source, article.category, hasOriginalVideo, videoLoading, shouldPreferBrowserSpeech, scenes.length])
 
   useEffect(() => subscribeExclusiveAudio(sessionIdRef.current, () => {
     stopNarration()
