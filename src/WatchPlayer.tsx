@@ -5,7 +5,7 @@ import { apiUrl, preloadAudioUrl, proxiedImageUrl } from './api'
 import { pickTtsVoice } from './ttsVoices'
 import type { CSSProperties } from 'react'
 
-const AUDIO_START_TIMEOUT_MS = 4000
+const AUDIO_START_TIMEOUT_MS = 8000
 
 interface WatchArticle {
   title: string
