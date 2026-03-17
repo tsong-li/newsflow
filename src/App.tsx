@@ -47,7 +47,6 @@ interface ArticleMedia {
 
 const WATCH_IMAGE_TARGET = 4
 const CATEGORY_VISUAL_PRELOAD_COUNT = 8
-const LISTEN_AUDIO_PRELOAD_COUNT = 4
 const FINANCE_SOURCES = new Set(['Bloomberg Markets', 'WSJ Markets'])
 const SPORTS_SOURCES = new Set(['ESPN', 'BBC Sport'])
 const ALL_VISUAL_CATEGORY_ORDER = ['Tech', 'Business', 'Sports', 'World', 'Science']
@@ -217,12 +216,6 @@ function App() {
     })
   }
 
-  function warmListenAudioBatch(items: NewsItem[], mode: 'single' | 'queue' = 'single', limit = LISTEN_AUDIO_PRELOAD_COUNT) {
-    items.slice(0, limit).forEach((item, index) => {
-      warmListenAudio(item, index, items, mode === 'queue' && index === 0 ? 'queue' : 'single')
-    })
-  }
-
   function warmVisualAssets(item: NewsItem, media: string[] = [], video: ArticleVideo | null = null) {
     const key = item.link
     const posterUrl = proxiedImageUrl(video?.poster || '') || video?.poster || ''
@@ -255,7 +248,6 @@ function App() {
     const key = getAnalysisKey(item)
 
     warmVisualAssets(item)
-    warmListenAudio(item, idx, news, 'single')
 
     if (!analysisPrefetchRef.current[key]) {
       analysisPrefetchRef.current[key] = true
@@ -321,10 +313,6 @@ function App() {
       .then((items) => {
         warmCategoryHero(category, items)
         warmCategoryVisuals(category, items)
-        if (items.length) {
-          warmListenAudio(items[0], 0, items, 'queue')
-          warmListenAudioBatch(items, 'single')
-        }
         return items
       })
   }
@@ -613,8 +601,6 @@ function App() {
     if (!news.length) return
 
     warmCategoryVisuals(tab, news)
-    warmListenAudio(news[0], 0, news, 'queue')
-    warmListenAudioBatch(news, 'single')
   }, [tab, news])
 
   useEffect(() => {
