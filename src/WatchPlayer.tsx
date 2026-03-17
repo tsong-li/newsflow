@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Pause, Play, X } from 'lucide-react'
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from './audioSession'
-import { apiUrl, proxiedImageUrl } from './api'
+import { apiUrl, preloadAudioUrl, proxiedImageUrl } from './api'
 import { pickTtsVoice } from './ttsVoices'
 import type { CSSProperties } from 'react'
 
@@ -425,6 +425,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioStartTimerRef = useRef<number | null>(null)
   const speechProgressTimerRef = useRef<number | null>(null)
+  const playbackRequestIdRef = useRef(0)
   const audioUrlCacheRef = useRef<Record<string, string>>({})
   const pendingAudioUrlRef = useRef<Record<string, Promise<string | null>>>({})
   const audioDurationMsRef = useRef<Record<string, number>>({})
@@ -470,13 +471,13 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
     if (pendingAudioUrlRef.current[cacheKey]) return pendingAudioUrlRef.current[cacheKey]
 
-    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(narration))
-      .then(async (response) => {
-        if (!response.ok) return null
-        const audioBlob = await response.blob()
-        const objectUrl = URL.createObjectURL(audioBlob)
-        audioUrlCacheRef.current[cacheKey] = objectUrl
-        return objectUrl
+    const requestUrl = buildTtsRequestUrl(narration)
+
+    pendingAudioUrlRef.current[cacheKey] = preloadAudioUrl(requestUrl)
+      .then((ok) => {
+        if (!ok) return null
+        audioUrlCacheRef.current[cacheKey] = requestUrl
+        return requestUrl
       })
       .catch(() => null)
       .finally(() => {
@@ -502,9 +503,6 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
 
   useEffect(() => {
     return () => {
-      Object.values(audioUrlCacheRef.current).forEach((url) => {
-        URL.revokeObjectURL(url)
-      })
       audioUrlCacheRef.current = {}
     }
   }, [])
@@ -547,6 +545,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
   }, [sceneIndex, scenes, shouldPreferBrowserSpeech, watchVoice.id])
 
   function stopNarration() {
+    playbackRequestIdRef.current += 1
     if (audioStartTimerRef.current !== null) {
       window.clearTimeout(audioStartTimerRef.current)
       audioStartTimerRef.current = null
@@ -625,6 +624,8 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     }
 
     stopNarration()
+  const playbackRequestId = playbackRequestIdRef.current + 1
+  playbackRequestIdRef.current = playbackRequestId
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
     setAudioPreparing(false)
     setUsingSpeechFallback(true)
@@ -642,11 +643,13 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
 
     const playbackStart = performance.now() - boundedResume
     speechProgressTimerRef.current = window.setInterval(() => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       const elapsed = Math.max(0, Math.min(scene.durationMs, performance.now() - playbackStart))
       syncSceneProgress(startIndex, elapsed)
     }, 120)
 
     utterance.onend = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       if (speechProgressTimerRef.current !== null) {
         window.clearInterval(speechProgressTimerRef.current)
         speechProgressTimerRef.current = null
@@ -654,6 +657,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
       advanceFromScene(startIndex, scene)
     }
     utterance.onerror = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       setUsingSpeechFallback(false)
       if (speechProgressTimerRef.current !== null) {
         window.clearInterval(speechProgressTimerRef.current)
@@ -683,21 +687,26 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
     requestExclusiveAudio({ ownerId: sessionIdRef.current, source: 'watch' })
     setUsingSpeechFallback(false)
     setAudioPreparing(true)
+    const playbackRequestId = playbackRequestIdRef.current + 1
+    playbackRequestIdRef.current = playbackRequestId
     const boundedResume = Math.max(0, Math.min(scene.durationMs, resumeMs))
     const resumeCaptionIndex = activeCaptionIndexForElapsed(scene, boundedResume)
 
     syncSceneProgress(startIndex, boundedResume, resumeCaptionIndex)
 
     const fallbackToSpeech = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       if (audioStartTimerRef.current !== null) {
         window.clearTimeout(audioStartTimerRef.current)
         audioStartTimerRef.current = null
       }
       if (audioRef.current) audioRef.current = null
+      playbackRequestIdRef.current += 1
       playSceneWithSpeechFallback(startIndex, boundedResume)
     }
 
     const startAudio = (sourceUrl: string) => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       const audio = new Audio(sourceUrl)
       audio.preload = 'auto'
       audioRef.current = audio
@@ -759,6 +768,7 @@ export default function WatchPlayer({ article, analysis, content, contentLoading
 
     void (pendingAudioUrlRef.current[cacheKey] || preloadSceneAudio(scene.narration))
       .then((preloadedUrl) => {
+        if (playbackRequestIdRef.current !== playbackRequestId) return
         if (audioStartTimerRef.current !== null) {
           window.clearTimeout(audioStartTimerRef.current)
           audioStartTimerRef.current = null

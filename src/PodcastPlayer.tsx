@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { SkipBack, Play, Pause, SkipForward, Minus, X, Headphones, AudioLines, Timer, ChevronDown } from "lucide-react"
 import { createAudioSessionId, requestExclusiveAudio, subscribeExclusiveAudio } from "./audioSession"
-import { apiUrl } from "./api"
+import { apiUrl, preloadAudioUrl } from "./api"
 import { pickSequentialTtsVoice } from "./ttsVoices"
 
 interface Article {
@@ -293,7 +293,7 @@ function weatherCodeLabel(code: number) {
   return labels[code] || "mixed weather"
 }
 
-function buildWeatherContext(city?: string, temperature?: number, weatherCode?: number): WeatherContext {
+export function buildWeatherContext(city?: string, temperature?: number, weatherCode?: number): WeatherContext {
   const dateLine = `Today is ${formatFriendlyDate()}.`
   const greeting = buildGreeting()
 
@@ -412,7 +412,7 @@ function buildBridgeLine(seed: string, text: string) {
   ])
 }
 
-function buildArticleNarration(
+export function buildArticleNarration(
   article: Article,
   content: ArticleContent | null,
   index: number,
@@ -472,6 +472,12 @@ function buildArticleNarration(
   return clipText(lines.filter(Boolean).join(" "), maxChars)
 }
 
+export function buildListenTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
+  let url = "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
+  if (maxChars) url += "&maxChars=" + maxChars
+  return apiUrl(url)
+}
+
 export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single', autoPlayToken = 0, onClose }: Props) {
   const [idx, setIdx] = useState(startIdx)
   const [playing, setPlaying] = useState(false)
@@ -481,7 +487,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     typeof window !== "undefined" ? window.innerWidth <= 768 : false,
   )
   const [weatherContext, setWeatherContext] = useState<WeatherContext>(() => buildWeatherContext())
-  const [weatherResolved, setWeatherResolved] = useState(false)
+  const [weatherResolved, setWeatherResolved] = useState(true)
   const [weatherSource, setWeatherSource] = useState<'gps' | 'ip' | 'none'>('none')
   const [usingSpeechFallback, setUsingSpeechFallback] = useState(false)
   const [audioDurationMs, setAudioDurationMs] = useState(0)
@@ -530,12 +536,6 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     return isQueueMode && targetIndex === startIdx
   }
 
-  function buildTtsRequestUrl(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
-    let url = "/api/tts?rewrite=1&mode=listen&allowGreeting=" + (allowGreeting ? "1" : "0") + "&text=" + encodeURIComponent(text.slice(0, 2000)) + (voiceId ? "&voice=" + encodeURIComponent(voiceId) : "")
-    if (maxChars) url += "&maxChars=" + maxChars
-    return apiUrl(url)
-  }
-
   function buildAudioCacheKey(text: string, voiceId?: string, allowGreeting = false, maxChars?: number) {
     return `${voiceId || 'default'}::${allowGreeting ? 'greet' : 'plain'}::${maxChars || 'full'}::${text.slice(0, 2000)}`
   }
@@ -573,13 +573,13 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     if (audioUrlCacheRef.current[cacheKey]) return audioUrlCacheRef.current[cacheKey]
     if (pendingAudioUrlRef.current[cacheKey]) return pendingAudioUrlRef.current[cacheKey]
 
-    pendingAudioUrlRef.current[cacheKey] = fetch(buildTtsRequestUrl(text, voiceId, allowGreeting, maxChars))
-      .then(async (response) => {
-        if (!response.ok) return null
-        const audioBlob = await response.blob()
-        const objectUrl = URL.createObjectURL(audioBlob)
-        audioUrlCacheRef.current[cacheKey] = objectUrl
-        return objectUrl
+    const requestUrl = buildListenTtsRequestUrl(text, voiceId, allowGreeting, maxChars)
+
+    pendingAudioUrlRef.current[cacheKey] = preloadAudioUrl(requestUrl)
+      .then((ok) => {
+        if (!ok) return null
+        audioUrlCacheRef.current[cacheKey] = requestUrl
+        return requestUrl
       })
       .catch(() => null)
       .finally(() => {
@@ -743,9 +743,6 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
         window.clearInterval(speechProgressTimerRef.current)
         speechProgressTimerRef.current = null
       }
-      Object.values(audioUrlCacheRef.current).forEach((url) => {
-        URL.revokeObjectURL(url)
-      })
       audioUrlCacheRef.current = {}
     }
   }, [])
@@ -893,6 +890,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
   const displayedElapsedMs = Math.round((Math.max(0, Math.min(progress, 100)) / 100) * displayedDurationMs)
 
   function doStop() {
+    playbackRequestIdRef.current += 1
     resumeProgressRef.current = Math.max(0, Math.min(1, progress / 100))
     if (audioRef.current) {
       audioRef.current.pause()
@@ -933,6 +931,9 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       return
     }
 
+    const playbackRequestId = playbackRequestIdRef.current + 1
+    playbackRequestIdRef.current = playbackRequestId
+
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current = null
@@ -969,6 +970,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
     const startedAt = performance.now()
     speechProgressTimerRef.current = window.setInterval(() => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       const elapsedRatio = Math.min(1, (performance.now() - startedAt) / remainingDurationMs)
       const nextRatio = boundedRatio + ((1 - boundedRatio) * elapsedRatio)
       setProgress(nextRatio * 100)
@@ -976,6 +978,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     }, 120)
 
     utterance.onend = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       if (speechProgressTimerRef.current !== null) {
         window.clearInterval(speechProgressTimerRef.current)
         speechProgressTimerRef.current = null
@@ -983,6 +986,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
       advanceToNextStory()
     }
     utterance.onerror = () => {
+      if (playbackRequestIdRef.current !== playbackRequestId) return
       if (speechProgressTimerRef.current !== null) {
         window.clearInterval(speechProgressTimerRef.current)
         speechProgressTimerRef.current = null
@@ -1018,10 +1022,11 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
     playbackRequestIdRef.current = playbackRequestId
     const fallbackToSpeech = () => {
       if (playbackRequestIdRef.current !== playbackRequestId) return
+      playbackRequestIdRef.current += 1
       playWithSpeechFallback(boundedRatio)
     }
     const allowGreeting = shouldAllowGreeting(idx)
-    const requestUrl = buildTtsRequestUrl(playbackScript, currentVoice?.id, allowGreeting, charBudget)
+    const requestUrl = buildListenTtsRequestUrl(playbackScript, currentVoice?.id, allowGreeting, charBudget)
     const cacheKey = buildAudioCacheKey(playbackScript, currentVoice?.id, allowGreeting, charBudget)
 
     const startAudio = (sourceUrl: string) => {
@@ -1074,6 +1079,7 @@ export default function PodcastPlayer({ articles, startIdx = 0, mode = 'single',
 
     void (pendingAudioUrlRef.current[cacheKey] || preloadAudio(playbackScript, currentVoice?.id, allowGreeting, charBudget))
       .then((preloadedUrl) => {
+        if (playbackRequestIdRef.current !== playbackRequestId) return
         if (audioStartTimerRef.current !== null) {
           window.clearTimeout(audioStartTimerRef.current)
           audioStartTimerRef.current = null

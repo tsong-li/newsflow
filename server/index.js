@@ -4,6 +4,11 @@ const Parser = require('rss-parser')
 const cheerio = require('cheerio')
 const FEEDS = require('./feeds')
 const GTTS = require('gtts')
+const { createEtag, matchesIfNoneMatch, setCacheHeaders, sendCacheableJson } = require('./httpCache')
+const { createPersistentBinaryCache } = require('./persistentCache')
+const { registerNewsRoutes } = require('./registerNewsRoutes')
+const { registerMediaRoutes } = require('./registerMediaRoutes')
+const { registerTtsRoutes } = require('./registerTtsRoutes')
 require('dotenv').config()
 
 const PORT = Number(process.env.PORT) || 3001
@@ -49,6 +54,7 @@ const pendingYouTubeSearchRequests = {}
 const backgroundWarmers = {}
 const CACHE_TTL = 10 * 60 * 1000
 const ANALYZE_CACHE_TTL = 60 * 60 * 1000
+const PERSISTENT_ASSET_CACHE_TTL = 24 * 60 * 60 * 1000
 const EXTERNAL_PAGE_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_PAGE_FETCH_TIMEOUT_MS) || 2500
 const OG_IMAGE_FETCH_TIMEOUT_MS = Number(process.env.OG_IMAGE_FETCH_TIMEOUT_MS) || 1500
 const TRUE_PATTERN = /^(1|true|yes|on)$/i
@@ -113,6 +119,8 @@ const TITLE_STOP_WORDS = new Set([
   'news', 'over', 'said', 'says', 'still', 'than', 'that', 'their', 'them', 'then', 'they', 'this', 'what', 'when', 'where',
   'will', 'with', 'your', 'while', 'under', 'could', 'would', 'should', 'across', 'because', 'against', 'behind', 'through',
 ])
+const persistentImageCache = createPersistentBinaryCache('images', 'bin')
+const persistentTtsCache = createPersistentBinaryCache('tts', 'mp3')
 
 function buildFallbackAnalysis(title, summary, source) {
   return {
@@ -1365,6 +1373,12 @@ async function getProxiedImage(url) {
   }
   if (pendingImageProxyRequests[normalizedUrl]) return pendingImageProxyRequests[normalizedUrl]
 
+   const diskCached = await persistentImageCache.get(normalizedUrl, PERSISTENT_ASSET_CACHE_TTL)
+   if (diskCached?.buffer) {
+    imageProxyCache[normalizedUrl] = diskCached
+    return diskCached
+   }
+
   pendingImageProxyRequests[normalizedUrl] = (async () => {
     try {
       const response = await fetchWithTimeout(normalizedUrl, { headers: IMAGE_PROXY_HEADERS }, EXTERNAL_PAGE_FETCH_TIMEOUT_MS)
@@ -1376,10 +1390,13 @@ async function getProxiedImage(url) {
       const result = {
         ts: Date.now(),
         contentType,
+        contentLength: response.headers.get('content-length') || '',
         buffer: Buffer.from(await response.arrayBuffer()),
-        etag: response.headers.get('etag') || '',
+        etag: response.headers.get('etag') || createEtag(`${normalizedUrl}|${contentType}|${response.headers.get('content-length') || ''}`),
+        lastModified: response.headers.get('last-modified') || '',
       }
 
+      await persistentImageCache.set(normalizedUrl, result)
       imageProxyCache[normalizedUrl] = result
       return result
     } catch (error) {
@@ -1792,289 +1809,60 @@ function warmCategory(category, options = {}) {
   return backgroundWarmers[cacheKey]
 }
 
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'newsflow-api',
-    timestamp: new Date().toISOString(),
-    host: HOST,
-    port: PORT,
-    analysisProvider: hasAzureOpenAIConfig()
-      ? 'azure-openai'
-      : (SILICONFLOW_API_KEY ? 'siliconflow' : 'fallback'),
-    ttsProvider: hasAzureSpeechConfig() ? 'azure-speech' : 'gtts',
-    azureSpeechConfigured: hasAzureSpeechConfig(),
-    azureSpeechRegion: AZURE_SPEECH_REGION || null,
-    azureSpeechEndpointConfigured: Boolean(AZURE_SPEECH_ENDPOINT),
-    ttsStrictAzure: TTS_STRICT_AZURE,
-    youtubeSearchEnabled: hasYouTubeDataApiConfig(),
-  })
+registerNewsRoutes(app, {
+  HOST,
+  PORT,
+  SILICONFLOW_API_KEY,
+  cache,
+  CACHE_TTL,
+  FEEDS,
+  pendingNewsRequests,
+  warmCategory,
+  buildCategoryArticles,
+  sendCacheableJson,
+  analyzeCache,
+  ANALYZE_CACHE_TTL,
+  pendingAnalyzeRequests,
+  hasAzureOpenAIConfig,
+  hasAzureSpeechConfig,
+  AZURE_SPEECH_REGION,
+  AZURE_SPEECH_ENDPOINT,
+  TTS_STRICT_AZURE,
+  hasYouTubeDataApiConfig,
+  buildFallbackAnalysis,
+  requestSiliconFlowAnalysis,
+  requestAzureAnalysis,
 })
 
-app.get('/api/news', async (req, res) => {
-  const category = req.query.category || 'All'
-  const feeds = FEEDS[category] || FEEDS['All']
-  const cacheKey = category
-
-  if (cache[cacheKey] && Date.now() - cache[cacheKey].ts < CACHE_TTL) {
-    return res.json(cache[cacheKey].data)
-  }
-
-  if (pendingNewsRequests[cacheKey]) {
-    return res.json(await pendingNewsRequests[cacheKey])
-  }
-
-  if (cache[cacheKey] && cacheKey === 'All') {
-    void warmCategory(category, { silent: true })
-    return res.json(cache[cacheKey].data)
-  }
-
-  if (cache[cacheKey]) {
-    pendingNewsRequests[cacheKey] = buildCategoryArticles(category, feeds)
-      .catch((error) => {
-        console.error(`refresh failed for ${category}:`, error.message)
-        return cache[cacheKey].data
-      })
-      .finally(() => {
-        delete pendingNewsRequests[cacheKey]
-      })
-    return res.json(cache[cacheKey].data)
-  }
-
-  try {
-    pendingNewsRequests[cacheKey] = buildCategoryArticles(category, feeds)
-    return res.json(await pendingNewsRequests[cacheKey])
-  } catch (error) {
-    console.error(`news load failed for ${category}:`, error.message)
-    return res.json([])
-  } finally {
-    delete pendingNewsRequests[cacheKey]
-  }
+registerMediaRoutes(app, {
+  STOCK_IMAGE_TARGET,
+  getSupplementalStockImages,
+  getArticleMedia,
+  sendCacheableJson,
+  buildMediaCacheKey,
+  getProxiedImage,
+  setCacheHeaders,
+  matchesIfNoneMatch,
+  getArticleVideo,
+  hasYouTubeDataApiConfig,
+  searchYouTubeVideos,
+  buildYouTubeSearchCacheKey,
+  getArticleContent,
 })
 
-// Deep Analysis endpoint
-app.get('/api/analyze', async (req, res) => {
-  const { title, summary, source } = req.query
-  if (!title) return res.status(400).json({ error: 'title required' })
-  const cacheKey = [title, summary || '', source || ''].join('||')
-
-  if (analyzeCache[cacheKey] && Date.now() - analyzeCache[cacheKey].ts < ANALYZE_CACHE_TTL) {
-    return res.json(analyzeCache[cacheKey].data)
-  }
-
-  if (pendingAnalyzeRequests[cacheKey]) {
-    return res.json(await pendingAnalyzeRequests[cacheKey])
-  }
-
-  const prompt = 'You are a news analyst. Analyze this article and respond in JSON only (no markdown):\n\nTitle: ' + title + '\nSource: ' + (source || 'unknown') + '\nSummary: ' + (summary || 'none') + '\n\nRespond with this exact JSON structure:\n{"tldr":"one sentence summary","keyPoints":["point 1","point 2","point 3"],"context":"broader context and implications in 2-3 sentences","sentiment":"Positive or Negative or Neutral","readTime":"X min read","tags":["tag1","tag2"]}'
-
-  try {
-    pendingAnalyzeRequests[cacheKey] = (async () => {
-      let parsed = null
-
-      if (SILICONFLOW_API_KEY) {
-        try {
-          parsed = await requestSiliconFlowAnalysis(prompt)
-        } catch (error) {
-          console.error('SiliconFlow analyze error:', error.message)
-        }
-      }
-
-      if (!parsed && hasAzureOpenAIConfig()) {
-        try {
-          parsed = await requestAzureAnalysis(prompt)
-        } catch (error) {
-          console.error('Azure OpenAI analyze fallback error:', error.message)
-        }
-      }
-
-      if (parsed) {
-        analyzeCache[cacheKey] = { ts: Date.now(), data: parsed }
-        return parsed
-      }
-
-      const fallback = buildFallbackAnalysis(title, summary, source)
-      analyzeCache[cacheKey] = { ts: Date.now(), data: fallback }
-      return fallback
-    })()
-
-    return res.json(await pendingAnalyzeRequests[cacheKey])
-  } catch (e) {
-    console.error('AI error:', e)
-    const fallback = buildFallbackAnalysis(title, summary, source)
-    analyzeCache[cacheKey] = { ts: Date.now(), data: fallback }
-    res.json(fallback)
-  } finally {
-    delete pendingAnalyzeRequests[cacheKey]
-  }
-})
-
-app.get('/api/article-media', async (req, res) => {
-  const link = String(req.query.link || '')
-  const title = String(req.query.title || '')
-  const category = String(req.query.category || '')
-  const primaryImage = String(req.query.primaryImage || '')
-  if (!link) return res.status(400).json({ error: 'link required' })
-
-  try {
-    return res.json(await getArticleMedia(link, { title, category, primaryImage }))
-  } catch (error) {
-    console.error('article media error:', error.message)
-    return res.json([])
-  }
-})
-
-app.get('/api/image', async (req, res) => {
-  const url = String(req.query.url || '')
-  if (!url) return res.status(400).json({ error: 'url required' })
-
-  try {
-    const proxied = await getProxiedImage(url)
-    if (!proxied?.buffer) {
-      return res.status(502).json({ error: 'image fetch failed' })
-    }
-
-    if (proxied.etag) {
-      res.setHeader('ETag', proxied.etag)
-    }
-    res.setHeader('Content-Type', proxied.contentType)
-    res.setHeader('Cache-Control', 'public, max-age=600, stale-while-revalidate=1800')
-    return res.end(proxied.buffer)
-  } catch (error) {
-    console.error('image proxy error:', error.message)
-    return res.status(502).json({ error: 'image proxy failed' })
-  }
-})
-
-app.get('/api/stock-images', async (req, res) => {
-  const title = String(req.query.title || '')
-  const category = String(req.query.category || '')
-  const count = Number(req.query.count || STOCK_IMAGE_TARGET)
-  const exclude = Array.isArray(req.query.exclude)
-    ? req.query.exclude.map((value) => String(value || ''))
-    : req.query.exclude
-      ? [String(req.query.exclude || '')]
-      : []
-
-  if (!title) return res.status(400).json({ error: 'title required' })
-
-  try {
-    return res.json(await getSupplementalStockImages(title, category, count, exclude))
-  } catch (error) {
-    console.error('stock images error:', error.message)
-    return res.json([])
-  }
-})
-
-app.get('/api/article-video', async (req, res) => {
-  const link = String(req.query.link || '')
-  if (!link) return res.status(400).json({ error: 'link required' })
-
-  try {
-    return res.json(await getArticleVideo(link))
-  } catch (error) {
-    console.error('article video error:', error.message)
-    return res.json(null)
-  }
-})
-
-app.get('/api/youtube-search', async (req, res) => {
-  const title = String(req.query.title || '')
-  const category = String(req.query.category || '')
-  const source = String(req.query.source || '')
-  const limit = Math.max(1, Math.min(Number(req.query.limit) || 1, 5))
-
-  if (!title) return res.status(400).json({ error: 'title required' })
-  if (!hasYouTubeDataApiConfig()) return res.json([])
-
-  try {
-    return res.json(await searchYouTubeVideos(title, category, source, limit))
-  } catch (error) {
-    console.error('youtube search error:', error.message)
-    return res.json([])
-  }
-})
-
-app.get('/api/article-content', async (req, res) => {
-  const link = String(req.query.link || '')
-  if (!link) return res.status(400).json({ error: 'link required' })
-
-  try {
-
-app.get('/api/tts-rewrite', async (req, res) => {
-  const text = String(req.query.text || '').slice(0, 2000)
-  const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
-  const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
-  const maxChars = Math.max(200, Math.min(2000, Number(req.query.maxChars) || 2000))
-  if (!text) return res.status(400).json({ error: 'text required' })
-
-  try {
-    const rewrittenText = await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars)
-    return res.json({ text: rewrittenText })
-  } catch (error) {
-    console.error('tts rewrite endpoint error:', error.message)
-    return res.json({ text })
-  }
-})
-    return res.json(await getArticleContent(link))
-  } catch (error) {
-    console.error('article content error:', error.message)
-    return res.json({ byline: '', subtitle: '', paragraphs: [] })
-  }
-})
-
-// TTS endpoint
-app.get('/api/tts', async (req, res) => {
-  const text = String(req.query.text || '').slice(0, 2000)
-  const requestedVoice = String(req.query.voice || '')
-  const rewriteRequested = !['0', 'false', 'no', 'off'].includes(String(req.query.rewrite || '').toLowerCase())
-  const rewriteMode = String(req.query.mode || 'listen').trim().toLowerCase() === 'watch' ? 'watch' : 'listen'
-  const allowGreeting = rewriteMode === 'watch' ? false : isTruthy(req.query.allowGreeting)
-  const strictAzure = TTS_STRICT_AZURE || isTruthy(req.query.strictAzure)
-  const maxChars = Math.max(200, Math.min(2000, Number(req.query.maxChars) || 2000))
-  if (!text) return res.status(400).json({ error: 'text required' })
-
-  try {
-    res.setHeader('Cache-Control', 'no-store')
-    const spokenText = rewriteRequested ? await rewriteTtsNarration(text, rewriteMode, allowGreeting, maxChars) : text
-
-    if (hasAzureSpeechConfig()) {
-      try {
-        const { audioBuffer, voiceName } = await synthesizeAzureSpeech(spokenText, requestedVoice)
-        res.setHeader('Content-Type', 'audio/mpeg')
-        res.setHeader('X-TTS-Provider', 'azure-speech')
-        res.setHeader('X-TTS-Voice', voiceName)
-        res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
-        return res.end(audioBuffer)
-      } catch (error) {
-        console.error('Azure Speech error:', error.message)
-        if (strictAzure) {
-          return res.status(502).json({
-            error: 'Azure Speech failed',
-            provider: 'azure-speech',
-            detail: error.message,
-          })
-        }
-      }
-    }
-
-  const gtts = new GTTS(spokenText, 'en')
-    res.setHeader('Content-Type', 'audio/mpeg')
-    res.setHeader('X-TTS-Provider', 'gtts')
-    res.setHeader('X-TTS-Fallback-From', 'azure-speech')
-  res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
-    return gtts.stream().on('error', (err) => {
-      console.error('gtts error:', err)
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'TTS failed' })
-      } else {
-        res.end()
-      }
-    }).pipe(res)
-  } catch (err) {
-    console.error('TTS error:', err)
-    return res.status(500).json({ error: 'TTS failed' })
-  }
+registerTtsRoutes(app, {
+  GTTS,
+  CACHE_TTL: PERSISTENT_ASSET_CACHE_TTL,
+  createEtag,
+  isTruthy,
+  sendCacheableJson,
+  setCacheHeaders,
+  matchesIfNoneMatch,
+  rewriteTtsNarration,
+  TTS_STRICT_AZURE,
+  hasAzureSpeechConfig,
+  synthesizeAzureSpeech,
+  persistentTtsCache,
 })
 
 app.listen(PORT, HOST, () => {
