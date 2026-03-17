@@ -52,6 +52,8 @@ const pendingPageRequests = {}
 const youtubeSearchCache = {}
 const pendingYouTubeSearchRequests = {}
 const backgroundWarmers = {}
+let azureSpeechQueue = Promise.resolve()
+let azureSpeechLastRequestAt = 0
 const CACHE_TTL = 10 * 60 * 1000
 const ANALYZE_CACHE_TTL = 60 * 60 * 1000
 const PERSISTENT_ASSET_CACHE_TTL = 24 * 60 * 60 * 1000
@@ -59,6 +61,7 @@ const EXTERNAL_PAGE_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_PAGE_FETCH_TI
 const OG_IMAGE_FETCH_TIMEOUT_MS = Number(process.env.OG_IMAGE_FETCH_TIMEOUT_MS) || 1500
 const AZURE_SPEECH_MAX_RETRIES = Math.max(0, Number(process.env.AZURE_SPEECH_MAX_RETRIES) || 2)
 const AZURE_SPEECH_RETRY_BASE_DELAY_MS = Math.max(250, Number(process.env.AZURE_SPEECH_RETRY_BASE_DELAY_MS) || 1200)
+const AZURE_SPEECH_MIN_INTERVAL_MS = Math.max(0, Number(process.env.AZURE_SPEECH_MIN_INTERVAL_MS) || 1500)
 const TRUE_PATTERN = /^(1|true|yes|on)$/i
 const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY
 const SILICONFLOW_MODEL = process.env.SILICONFLOW_MODEL || 'Qwen/Qwen2.5-7B-Instruct'
@@ -445,11 +448,27 @@ function parseRetryAfterMs(value, fallbackMs) {
   return fallbackMs
 }
 
+function enqueueAzureSpeech(task) {
+  const run = azureSpeechQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const waitMs = Math.max(0, (azureSpeechLastRequestAt + AZURE_SPEECH_MIN_INTERVAL_MS) - Date.now())
+      if (waitMs > 0) {
+        await sleep(waitMs)
+      }
+      azureSpeechLastRequestAt = Date.now()
+      return task()
+    })
+
+  azureSpeechQueue = run.catch(() => undefined)
+  return run
+}
+
 async function synthesizeAzureSpeech(text, voiceName) {
   const selectedVoice = resolveAzureSpeechVoice(voiceName)
   const ssml = `<?xml version="1.0" encoding="utf-8"?><speak version="1.0" xml:lang="en-US"><voice name="${selectedVoice}"><prosody rate="0%" pitch="0%">${escapeSsml(text)}</prosody></voice></speak>`
   for (let attempt = 0; attempt <= AZURE_SPEECH_MAX_RETRIES; attempt += 1) {
-    const resp = await fetch(AZURE_SPEECH_ENDPOINT, {
+    const resp = await enqueueAzureSpeech(() => fetch(AZURE_SPEECH_ENDPOINT, {
       method: 'POST',
       headers: {
         'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
@@ -458,7 +477,7 @@ async function synthesizeAzureSpeech(text, voiceName) {
         'User-Agent': 'NewsFlow',
       },
       body: ssml,
-    })
+    }))
 
     if (resp.ok) {
       return {
