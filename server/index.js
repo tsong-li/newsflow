@@ -38,8 +38,6 @@ const analyzeCache = {}
 const pendingAnalyzeRequests = {}
 const ttsRewriteCache = {}
 const pendingTtsRewriteRequests = {}
-const ttsAudioCache = {}
-const pendingTtsAudioRequests = {}
 const pendingMediaRequests = {}
 const pendingImageProxyRequests = {}
 const pendingVideoRequests = {}
@@ -51,9 +49,6 @@ const pendingYouTubeSearchRequests = {}
 const backgroundWarmers = {}
 const CACHE_TTL = 10 * 60 * 1000
 const ANALYZE_CACHE_TTL = 60 * 60 * 1000
-const TTS_AUDIO_CACHE_TTL = 20 * 60 * 1000
-const TTS_AUDIO_CACHE_MAX_ENTRIES = 64
-const AZURE_SPEECH_MIN_INTERVAL_MS = Number(process.env.AZURE_SPEECH_MIN_INTERVAL_MS) || 700
 const EXTERNAL_PAGE_FETCH_TIMEOUT_MS = Number(process.env.EXTERNAL_PAGE_FETCH_TIMEOUT_MS) || 2500
 const OG_IMAGE_FETCH_TIMEOUT_MS = Number(process.env.OG_IMAGE_FETCH_TIMEOUT_MS) || 1500
 const TRUE_PATTERN = /^(1|true|yes|on)$/i
@@ -69,9 +64,6 @@ const YOUTUBE_DATA_API_KEY = process.env.YOUTUBE_DATA_API_KEY
 const AZURE_SPEECH_KEY = process.env.AZURE_SPEECH_KEY
 const RAW_AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim()
 const RAW_AZURE_SPEECH_ENDPOINT = String(process.env.AZURE_SPEECH_ENDPOINT || '').trim()
-const AZURE_SPEECH_KEY_BACKUP = process.env.AZURE_SPEECH_KEY_BACKUP
-const RAW_AZURE_SPEECH_REGION_BACKUP = String(process.env.AZURE_SPEECH_REGION_BACKUP || '').trim()
-const RAW_AZURE_SPEECH_ENDPOINT_BACKUP = String(process.env.AZURE_SPEECH_ENDPOINT_BACKUP || '').trim()
 const AZURE_SPEECH_VOICE = process.env.AZURE_SPEECH_VOICE || 'en-US-AndrewMultilingualNeural'
 const DEFAULT_AZURE_SPEECH_VOICES = [
   'en-US-JennyNeural',
@@ -121,67 +113,6 @@ const TITLE_STOP_WORDS = new Set([
   'news', 'over', 'said', 'says', 'still', 'than', 'that', 'their', 'them', 'then', 'they', 'this', 'what', 'when', 'where',
   'will', 'with', 'your', 'while', 'under', 'could', 'would', 'should', 'across', 'because', 'against', 'behind', 'through',
 ])
-let azureSpeechQueue = Promise.resolve()
-let azureSpeechNextAllowedAt = 0
-
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function pruneExpiredEntries(store, ttl) {
-  const now = Date.now()
-  for (const [key, entry] of Object.entries(store)) {
-    if (!entry || (now - entry.createdAt) > ttl) {
-      delete store[key]
-    }
-  }
-}
-
-function enforceMaxEntries(store, maxEntries) {
-  const entries = Object.entries(store)
-  if (entries.length <= maxEntries) return
-
-  entries
-    .sort((left, right) => (left[1]?.createdAt || 0) - (right[1]?.createdAt || 0))
-    .slice(0, entries.length - maxEntries)
-    .forEach(([key]) => {
-      delete store[key]
-    })
-}
-
-function parseRetryAfterMs(value) {
-  const rawValue = String(value || '').trim()
-  if (!rawValue) return 0
-
-  const seconds = Number(rawValue)
-  if (Number.isFinite(seconds) && seconds > 0) return Math.round(seconds * 1000)
-
-  const retryDate = Date.parse(rawValue)
-  if (!Number.isNaN(retryDate)) {
-    return Math.max(0, retryDate - Date.now())
-  }
-
-  return 0
-}
-
-function queueAzureSpeechRequest(task) {
-  const runTask = async () => {
-    const waitMs = Math.max(0, azureSpeechNextAllowedAt - Date.now())
-    if (waitMs > 0) {
-      await wait(waitMs)
-    }
-
-    try {
-      return await task()
-    } finally {
-      azureSpeechNextAllowedAt = Math.max(azureSpeechNextAllowedAt, Date.now() + AZURE_SPEECH_MIN_INTERVAL_MS)
-    }
-  }
-
-  const request = azureSpeechQueue.then(runTask, runTask)
-  azureSpeechQueue = request.then(() => undefined, () => undefined)
-  return request
-}
 
 function buildFallbackAnalysis(title, summary, source) {
   return {
@@ -279,26 +210,9 @@ function resolveAzureSpeechEndpoint(endpointValue, regionValue) {
 
 const AZURE_SPEECH_REGION = extractAzureSpeechRegion(RAW_AZURE_SPEECH_REGION || RAW_AZURE_SPEECH_ENDPOINT)
 const AZURE_SPEECH_ENDPOINT = resolveAzureSpeechEndpoint(RAW_AZURE_SPEECH_ENDPOINT, RAW_AZURE_SPEECH_REGION)
-const AZURE_SPEECH_REGION_BACKUP = extractAzureSpeechRegion(RAW_AZURE_SPEECH_REGION_BACKUP || RAW_AZURE_SPEECH_ENDPOINT_BACKUP)
-const AZURE_SPEECH_ENDPOINT_BACKUP = resolveAzureSpeechEndpoint(RAW_AZURE_SPEECH_ENDPOINT_BACKUP, RAW_AZURE_SPEECH_REGION_BACKUP)
-const AZURE_SPEECH_CONFIGS = [
-  {
-    label: 'primary',
-    key: AZURE_SPEECH_KEY,
-    endpoint: AZURE_SPEECH_ENDPOINT,
-    region: AZURE_SPEECH_REGION,
-  },
-  {
-    label: 'backup',
-    key: AZURE_SPEECH_KEY_BACKUP,
-    endpoint: AZURE_SPEECH_ENDPOINT_BACKUP,
-    region: AZURE_SPEECH_REGION_BACKUP,
-  },
-].filter((config) => Boolean(config.key && config.endpoint))
 
-function hasAzureSpeechConfig(config) {
-  if (config) return Boolean(config.key && config.endpoint)
-  return AZURE_SPEECH_CONFIGS.length > 0
+function hasAzureSpeechConfig() {
+  return Boolean(AZURE_SPEECH_KEY && AZURE_SPEECH_ENDPOINT)
 }
 
 function hasYouTubeDataApiConfig() {
@@ -507,71 +421,26 @@ function resolveAzureSpeechVoice(requestedVoice) {
 
 async function synthesizeAzureSpeech(text, voiceName) {
   const selectedVoice = resolveAzureSpeechVoice(voiceName)
-  const cacheKey = `${selectedVoice}::${String(text || '')}`
-  pruneExpiredEntries(ttsAudioCache, TTS_AUDIO_CACHE_TTL)
-
-  const cachedEntry = ttsAudioCache[cacheKey]
-  if (cachedEntry) {
-    return {
-      audioBuffer: cachedEntry.audioBuffer,
-      voiceName: selectedVoice,
-      cacheHit: true,
-    }
-  }
-
-  if (pendingTtsAudioRequests[cacheKey]) {
-    return pendingTtsAudioRequests[cacheKey]
-  }
-
-  pendingTtsAudioRequests[cacheKey] = queueAzureSpeechRequest(async () => {
-    const ssml = `<?xml version="1.0" encoding="utf-8"?><speak version="1.0" xml:lang="en-US"><voice name="${selectedVoice}"><prosody rate="0%" pitch="0%">${escapeSsml(text)}</prosody></voice></speak>`
-    const errors = []
-
-    for (const config of AZURE_SPEECH_CONFIGS) {
-      try {
-        const resp = await fetch(config.endpoint, {
-          method: 'POST',
-          headers: {
-            'Ocp-Apim-Subscription-Key': config.key,
-            'Content-Type': 'application/ssml+xml',
-            'X-Microsoft-OutputFormat': AZURE_SPEECH_OUTPUT_FORMAT,
-            'User-Agent': 'NewsFlow',
-          },
-          body: ssml,
-        })
-
-        if (!resp.ok) {
-          const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'))
-          if (retryAfterMs > 0) {
-            azureSpeechNextAllowedAt = Math.max(azureSpeechNextAllowedAt, Date.now() + retryAfterMs)
-          }
-          errors.push(`${config.label}:${resp.status}`)
-          continue
-        }
-
-        const result = {
-          audioBuffer: Buffer.from(await resp.arrayBuffer()),
-          voiceName: selectedVoice,
-          cacheHit: false,
-          configLabel: config.label,
-        }
-        ttsAudioCache[cacheKey] = {
-          audioBuffer: result.audioBuffer,
-          createdAt: Date.now(),
-        }
-        enforceMaxEntries(ttsAudioCache, TTS_AUDIO_CACHE_MAX_ENTRIES)
-        return result
-      } catch (error) {
-        errors.push(`${config.label}:${error.message}`)
-      }
-    }
-
-    throw new Error(`Azure Speech request failed (${errors.join(', ')})`)
-  }).finally(() => {
-    delete pendingTtsAudioRequests[cacheKey]
+  const ssml = `<?xml version="1.0" encoding="utf-8"?><speak version="1.0" xml:lang="en-US"><voice name="${selectedVoice}"><prosody rate="0%" pitch="0%">${escapeSsml(text)}</prosody></voice></speak>`
+  const resp = await fetch(AZURE_SPEECH_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': AZURE_SPEECH_OUTPUT_FORMAT,
+      'User-Agent': 'NewsFlow',
+    },
+    body: ssml,
   })
 
-  return pendingTtsAudioRequests[cacheKey]
+  if (!resp.ok) {
+    throw new Error('Azure Speech request failed with status ' + resp.status)
+  }
+
+  return {
+    audioBuffer: Buffer.from(await resp.arrayBuffer()),
+    voiceName: selectedVoice,
+  }
 }
 
 function toArray(value) {
@@ -1937,8 +1806,6 @@ app.get('/api/health', (req, res) => {
     azureSpeechConfigured: hasAzureSpeechConfig(),
     azureSpeechRegion: AZURE_SPEECH_REGION || null,
     azureSpeechEndpointConfigured: Boolean(AZURE_SPEECH_ENDPOINT),
-    azureSpeechBackupConfigured: hasAzureSpeechConfig(AZURE_SPEECH_CONFIGS.find((config) => config.label === 'backup')),
-    azureSpeechBackupRegion: AZURE_SPEECH_REGION_BACKUP || null,
     ttsStrictAzure: TTS_STRICT_AZURE,
     youtubeSearchEnabled: hasYouTubeDataApiConfig(),
   })
@@ -2173,12 +2040,10 @@ app.get('/api/tts', async (req, res) => {
 
     if (hasAzureSpeechConfig()) {
       try {
-        const { audioBuffer, voiceName, cacheHit, configLabel } = await synthesizeAzureSpeech(spokenText, requestedVoice)
+        const { audioBuffer, voiceName } = await synthesizeAzureSpeech(spokenText, requestedVoice)
         res.setHeader('Content-Type', 'audio/mpeg')
         res.setHeader('X-TTS-Provider', 'azure-speech')
         res.setHeader('X-TTS-Voice', voiceName)
-        res.setHeader('X-TTS-Cache', cacheHit ? 'hit' : 'miss')
-        res.setHeader('X-TTS-Config', configLabel || 'primary')
         res.setHeader('X-TTS-Rewritten', rewriteRequested ? 'true' : 'false')
         return res.end(audioBuffer)
       } catch (error) {

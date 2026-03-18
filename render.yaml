@@ -31,12 +31,6 @@ services:
         sync: false
       - key: AZURE_SPEECH_ENDPOINT
         sync: false
-      - key: AZURE_SPEECH_KEY_BACKUP
-        sync: false
-      - key: AZURE_SPEECH_REGION_BACKUP
-        sync: false
-      - key: AZURE_SPEECH_ENDPOINT_BACKUP
-        sync: false
       - key: AZURE_SPEECH_VOICE
         value: en-US-AndrewMultilingualNeural
       - key: AZURE_SPEECH_VOICES
